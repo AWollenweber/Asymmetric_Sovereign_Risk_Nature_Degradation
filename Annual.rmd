@@ -1,0 +1,805 @@
+---
+title: "Paper 1 Annual"
+author: "Alexander Wollenweber"
+date: "2026-05-09"
+output: 
+  html_document: 
+    theme: readable
+    fig_width: 8
+    fig_height: 6
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) # Change to own directory
+knitr::opts_knit$set(root.dir = "~/Documents/DPhil - Oxford/Research/Paper 1")
+setwd("~/Documents/DPhil - Oxford/Research/Paper 1")
+options(scipen = 999)
+```
+
+## Load Annual Data, Libraries and Functions
+```{r Load Data, Libraries and Functions}
+rm(list = ls())
+
+packages <- c("dplyr", "readr", "zoo", "readxl", "tidyr", "ggplot2", "lubridate", "splines", "psych", "ggrepel", "plm", "gt", "kableExtra", "flextable", "ggcorrplot", "Hmisc", "quantreg", "ggeffects", "broom", "rnaturalearth", "rnaturalearthdata", "sf", "olsrr", "performance", "see", "lmtest", "sandwich", "pqrfe", "wesanderson", "interactions", "stargazer", "sjPlot", "sjmisc", "sjlabelled", "texreg", "lmtest", "panelvar", "clubSandwich", "quantreg", "dynamite","missMDA", "gsynth", "lqmix")
+
+new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+lapply(packages, library, character.only = TRUE)
+
+QData <- read_excel("QData.xlsx", sheet = "Master Data")
+```
+
+```{r Set Variables}
+QData <- QData %>%
+  mutate(
+    Year = as.numeric(Year),
+    Q = as.numeric(Q),
+    TimeNumeric = Year + (Q - 1) / 4
+  )
+QData$YearQtr <- as.yearqtr(QData$YearQtr)
+```
+
+```{r Duplicate Data Check}
+duplicate_rows <- QData %>%
+  group_by(ISO3, TimeNumeric) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  filter(n > 1)
+
+if (nrow(duplicate_rows) > 0) {
+  cat("Found duplicate time points for the following countries:\n")
+  print(knitr::kable(duplicate_rows, caption = "Duplicate Time Points by Country"))
+} else {
+  cat("No duplicate time points found in the dataset.\n")
+}
+```
+
+```{r Compute EPI: Biodiversity and Habitat Sub-index}
+Nature_Data <- read_excel("QData.xlsx", sheet = "Nature")
+
+# EPI Biodiversity & Habitat Sub-index (BDH): weighted average of 8 sub-indicators.
+# Raw weights from the 2024 EPI methodology, normalised to sum to 1:
+#   MKP  Marine KBA Protection          0.12  -> 0.146
+#   MHP  Marine Habitat Protection      0.12  -> 0.146
+#   MPE  Marine Protection Stringency   0.02  -> 0.024
+#   SPI  Species Protection Index       0.16  -> 0.195
+#   TBN  Terrestrial Biome Protection   0.10  -> 0.122
+#   TKP  Terrestrial KBA Protection     0.10  -> 0.122
+#   RLI  Red List Index                 0.12  -> 0.146
+#   SHI  Species Habitat Index          0.08  -> 0.098
+
+bdh_raw_weights <- c(MKP = 0.12, MHP = 0.12, MPE = 0.02, SPI = 0.16,
+                     TBN = 0.10, TKP = 0.10, RLI = 0.12, SHI = 0.08)
+bdh_norm_weights <- bdh_raw_weights / sum(bdh_raw_weights)
+
+Nature_Data <- Nature_Data %>%
+  rowwise() %>%
+  mutate(
+    BDH_computed = {
+      vals <- c_across(all_of(names(bdh_raw_weights)))
+      avail <- !is.na(vals)
+      if (sum(avail) == 0) NA_real_
+      else sum(vals[avail] * bdh_norm_weights[avail]) / sum(bdh_norm_weights[avail])
+    }
+  ) %>%
+  ungroup()
+
+validation_bdh <- Nature_Data %>%
+  filter(!is.na(BDH) & !is.na(BDH_computed)) %>%
+  mutate(diff = abs(BDH - BDH_computed))
+cat("BDH validation: max diff =", max(validation_bdh$diff),
+    "| n =", nrow(validation_bdh), "\n")
+
+Nature_Data <- Nature_Data %>%
+  mutate(BDH = coalesce(BDH, BDH_computed)) %>%
+  select(-BDH_computed)
+
+cat("BDH coverage:", sum(!is.na(Nature_Data$BDH)), "of", nrow(Nature_Data), "rows\n")
+```
+
+## Annual Sample Construction
+
+```{r Annual Sample}
+# Take Q1 of each year as the annual observation. Slow-moving environmental
+# indicators (BII, BDH, BHI, NDGAIN) are observed annually and reported in Q1
+# of the source spreadsheet, so this preserves all original (pre-interpolation)
+# environmental data points.
+AData <- QData %>%
+  filter(Q == 1) %>%
+  arrange(ISO3, Year)
+
+cat("Annual sample: ", nrow(AData), "country-year rows across",
+    length(unique(AData$ISO3)), "countries.\n")
+```
+
+## Mutate Variables
+```{r Rename and Mutate Variables}
+AData <- AData %>%
+  mutate(
+    Inv_BII = 100 - BII,
+    Inv_BDH = 100 - BDH,
+    ln_WBRNC = log(WBNCR),
+    Inv_BHI = 100 - BHI,
+    Inv_BHISpecies = 100 - BHISpecies,
+    Inv_BHIAvg = 100 - BHIAvg,
+    `BII_Vul_TC` = Inv_BII * `RNC/TC Ratio`,
+    `BHIAvg_Vul` = Inv_BHIAvg * `RNC/TC Ratio`,
+    `BHI_Vul` = Inv_BHI * `RNC/TC Ratio`,
+    `BHISpecies_Vul` = Inv_BHISpecies * `RNC/TC Ratio`,
+    `RNC/TC` = WBNCR/WBTC,
+    BII_Vul_TC_Test = Inv_BII * `RNC/TC`,
+    DebtGDP = DebtGDP/100
+  )
+
+AData <- AData %>%
+  rename(GDP = `WB GDP`, ChinnIto = `Chinn-Ito`,
+         EPI = Inv_BDH, NDGAIN = Vulnerability,
+         WB_Classification = `WB Classification`,
+         IMF_Classification = `IMF Classification`)
+
+# Re-scale weighted indices to 0-100
+AData <- AData %>%
+  mutate(
+    max_BII_Vul_TC = max(BII_Vul_TC, na.rm = TRUE),
+    max_BHIAvg_Vul = max(BHIAvg_Vul, na.rm = TRUE),
+    BII_Weighted = (BII_Vul_TC / max_BII_Vul_TC) * 100,
+    BHI_Weighted = (BHIAvg_Vul / max_BHIAvg_Vul) * 100,
+    max_BII_Vul_TC = NULL,
+    max_BHIAvg_Vul = NULL,
+    WGI_CC = WGI_CC + 2.5,
+    WGI_GE = WGI_GE + 2.5,
+    WGI_RL = WGI_RL + 2.5,
+    WGI_IQ = (WGI_CC + WGI_GE + WGI_RL) / 3
+  )
+
+# Standardise main regressors to unit within-country variance
+vars_to_standardize <- c(
+  "BII_Weighted", "BHI_Weighted", "EPI", "NDGAIN",
+  "Inflation", "PB", "CA", "GDP", "DebtGDP",
+  "FM_Depth", "WGI_RL", "CPI_Food"
+)
+
+within_sds_map <- AData %>%
+  group_by(ISO3) %>%
+  mutate(across(all_of(vars_to_standardize), ~ . - mean(., na.rm = TRUE))) %>%
+  ungroup() %>%
+  summarise(across(all_of(vars_to_standardize), ~ sd(., na.rm = TRUE))) %>%
+  as.list()
+
+AData <- AData %>%
+  mutate(across(all_of(vars_to_standardize),
+                ~ . / within_sds_map[[cur_column()]]))
+
+cat("Calculated within-country standard deviations for standardization:\n")
+print(within_sds_map)
+
+# Lag generation (annual: L1 = 1 year, L2 = 2 years).
+# Naming preserved as _L1/_L2 so model formulas mirror the quarterly script;
+# interpretation differs (1 year vs 1 quarter).
+AData <- AData %>%
+  group_by(ISO3) %>%
+  mutate(
+    BII_Weighted_L1 = dplyr::lag(BII_Weighted, 1),
+    BII_Weighted_L2 = dplyr::lag(BII_Weighted, 2),
+    BHI_Weighted_L1 = dplyr::lag(BHI_Weighted, 1),
+    BHI_Weighted_L2 = dplyr::lag(BHI_Weighted, 2),
+    EPI_L1 = dplyr::lag(EPI, 1),
+    EPI_L2 = dplyr::lag(EPI, 2),
+    NDGAIN_L1 = dplyr::lag(NDGAIN, 1),
+    NDGAIN_L2 = dplyr::lag(NDGAIN, 2),
+    ER_t1 = dplyr::lead(ER, n = 1)
+  ) %>%
+  ungroup()
+```
+
+```{r Outlier Removal}
+exclude_country_years <- c(
+  "GRC2011", "GRC2012", "GRC2013","GRC2014", "GRC2015",
+  "IRL2015","IRL2016", "IRL2020",
+  "CHN2020",
+  "TUR2000", "TUR2001", "TUR2002", "TUR2003", "TUR2004", "TUR2008","TUR2009","TUR2018",
+  "LKA2015", "LKA2016",
+  "UGA2020",
+  "ZMB2016", "ZMB2020")
+
+# Country-level filter (aligned with quarterly QData_Final)
+AData_clean <- AData %>%
+  filter(!(CountryYear %in% exclude_country_years)) %>%
+  filter(!(ISO3 %in% c("NAM", "NGA", "TUN")))
+
+AData_Final <- AData_clean
+```
+
+## IFE Models
+```{r Interactive Fixed Effects}
+# Prepare base data for interFE (requires numeric panel index)
+AData_IFE <- as.data.frame(AData_Final)
+AData_IFE$Year <- as.numeric(as.factor(AData_IFE$Year))
+AData_IFE$ISO3 <- as.character(AData_IFE$ISO3)
+
+# Manual test
+cols_needed <- c("TwoYrSpread", "BHI_Weighted", "Inflation", "PB", "CA", "GDP", "DebtGDP", "FM_Depth", "WGI_RL", "ISO3", "YearQtr", "CPI_Food")
+AData_IFE_Test <- AData_IFE[cols_needed]
+# 3. Drop rows with ANY missing values in these columns
+AData_IFE_Test <- na.omit(AData_IFE_Test)
+FiveBII_IFE <- interFE(TwoYrSpread ~ BHI_Weighted + Inflation + PB + CA + GDP + DebtGDP + FM_Depth + WGI_RL + CPI_Food, data = AData_IFE_Test, index = c("ISO3", "YearQtr"),  r =2,  force = "unit", nboots = 150, seed = 1)
+
+# Headline IFE grid: 3 DVs x 4 IVs x {k=1, k=2}
+# interFE() uses argument r; object names use k to avoid confusion with R-squared.
+dependent_vars   <- c("TwoYrSpread", "FiveYrSpread", "TenYrSpread")
+independent_vars <- c("BII_Weighted", "BHI_Weighted", "NDGAIN", "EPI")
+controls         <- c("Inflation", "PB", "CA", "GDP", "DebtGDP",
+                      "FM_Depth", "WGI_RL", "CPI_Food")
+
+run_ife_grid <- function(k_factors) {
+  results <- list()
+  for (dv in dependent_vars) {
+    for (iv in independent_vars) {
+      model_name <- paste(dv, iv, sep = "_")
+      message(paste("Running IFE k=", k_factors, ":", model_name))
+
+      formula_str <- paste(dv, "~", iv, "+", paste(controls, collapse = " + "))
+      cols_needed <- c(dv, iv, controls, "ISO3", "Year")
+
+      missing_cols <- setdiff(cols_needed, names(AData_IFE))
+      if (length(missing_cols) > 0) {
+        warning(paste("Missing columns for", model_name, ":",
+                      paste(missing_cols, collapse = ", "), "- skipping"))
+        next
+      }
+
+      data_subset <- na.omit(AData_IFE[, cols_needed])
+      if (nrow(data_subset) < 50) {
+        warning(paste("Insufficient data for", model_name, "- skipping"))
+        next
+      }
+
+      fit <- tryCatch({
+        interFE(
+          formula = as.formula(formula_str),
+          data    = data_subset,
+          index   = c("ISO3", "Year"),
+          r       = k_factors,
+          force   = "unit",
+          nboots  = 1000,
+          se      = TRUE,
+          seed    = 1,
+          normalize = FALSE
+        )
+      }, error = function(e) {
+        message(paste("Error in", model_name, ":", e$message)); NULL
+      })
+
+      if (!is.null(fit)) {
+        results[[model_name]] <- fit
+        print(paste("--- Results for", model_name, "(k=", k_factors, ") ---"))
+        print(fit$est.table)
+      }
+    }
+  }
+  results
+}
+
+ife_results_k1_list <- run_ife_grid(1)
+ife_results_k2_list <- run_ife_grid(2)
+ife_results_k0_list <- run_ife_grid(0)
+
+saveRDS(ife_results_k1_list, file = "ife_results_k1_annual.rds")
+saveRDS(ife_results_k2_list, file = "ife_results_k2_annual.rds")
+saveRDS(ife_results_k0_list, file = "ife_results_k0_annual.rds")
+
+# Reload helper (use after a full run, or skip the loops above)
+# ife_results_k1_list <- readRDS("ife_results_k1_annual.rds")
+# ife_results_k2_list <- readRDS("ife_results_k2_annual.rds")
+
+# --- Extract ALL coefficients from IFE results ---
+extract_all_ife_coefficients <- function(ife_list) {
+  all_coefs <- list()
+  for (model_name in names(ife_list)) {
+    fit <- ife_list[[model_name]]
+    if (is.null(fit) || is.null(fit$est.table)) {
+      message(paste("Skipping", model_name, "- no coefficients found.")); next
+    }
+    coefs <- fit$est.table
+
+    dv_name <- NA
+    if (grepl("TwoYrSpread", model_name)) dv_name <- "TwoYrSpread"
+    if (grepl("FiveYrSpread", model_name)) dv_name <- "FiveYrSpread"
+    if (grepl("TenYrSpread", model_name)) dv_name <- "TenYrSpread"
+
+    iv_name <- NA
+    if (grepl("BII_Weighted", model_name)) iv_name <- "BII_Weighted_L1"
+    if (grepl("BHI_Weighted", model_name)) iv_name <- "BHI_Weighted_L1"
+    if (grepl("NDGAIN", model_name) || grepl("Vulnerability", model_name)) iv_name <- "NDGAIN_L1"
+    if (grepl("EPI", model_name)) iv_name <- "EPI_L1"
+
+    for (var_name in rownames(coefs)) {
+      est <- coefs[var_name, "Coef"]
+      se  <- coefs[var_name, "S.E."]
+      pv  <- coefs[var_name, "p.value"]
+      cl  <- coefs[var_name, "CI.lower"]
+      cu  <- coefs[var_name, "CI.upper"]
+
+      sig <- case_when(
+        pv < 0.01 ~ "***",
+        pv < 0.05 ~ "**",
+        pv < 0.1  ~ "*",
+        TRUE ~ ""
+      )
+
+      all_coefs[[length(all_coefs) + 1]] <- data.frame(
+        Model = model_name,
+        Dependent_Variable = dv_name,
+        Independent_Variable = iv_name,
+        Variable = var_name,
+        Estimate = est,
+        Std_Error = se,
+        P_Value = pv,
+        CI_Lower = cl,
+        CI_Upper = cu,
+        Significance = sig,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  do.call(rbind, all_coefs)
+}
+
+ife_results_k1 <- extract_all_ife_coefficients(ife_results_k1_list)
+ife_results_k2 <- extract_all_ife_coefficients(ife_results_k2_list)
+ife_results_k0 <- extract_all_ife_coefficients(ife_results_k0_list)
+
+# --- Within R^2 helper ---
+calculate_ife_within_r2 <- function(ife_list) {
+  r2_results <- data.frame()
+  for (model_name in names(ife_list)) {
+    fit <- ife_list[[model_name]]
+    if (is.null(fit) || is.null(fit$est.table)) next
+
+    Y_mat   <- fit$dat.Y
+    res_mat <- fit$residuals
+    obs <- !is.na(Y_mat) & !is.na(res_mat)
+    obs <- obs & (Y_mat != 0 | res_mat != 0)
+
+    Y_within <- Y_mat
+    for (j in seq_len(ncol(Y_mat))) {
+      idx_j <- obs[, j]
+      if (any(idx_j)) {
+        mu_j <- mean(Y_mat[idx_j, j], na.rm = TRUE)
+        Y_within[idx_j, j] <- Y_mat[idx_j, j] - mu_j
+        Y_within[!idx_j, j] <- NA
+      } else {
+        Y_within[, j] <- NA
+      }
+    }
+    T_per_country <- colSums(obs, na.rm = TRUE)
+    n_countries   <- sum(T_per_country > 0)
+    avg_T <- mean(T_per_country[T_per_country > 0], na.rm = TRUE)
+
+    y_within_vec <- as.numeric(Y_within[obs])
+    res_vec      <- as.numeric(res_mat[obs])
+    TSS_within <- sum((y_within_vec - mean(y_within_vec, na.rm = TRUE))^2, na.rm = TRUE)
+    RSS        <- sum(res_vec^2, na.rm = TRUE)
+
+    if (TSS_within > 0) {
+      R2_within <- 1 - RSS / TSS_within
+      n_obs <- length(y_within_vec)
+      n_covars <- nrow(fit$est.table) - 1
+      Adj_R2_within <- if (n_obs > n_covars + 1)
+        1 - (1 - R2_within) * ((n_obs - 1) / (n_obs - n_covars - 1)) else NA
+
+      r2_results <- rbind(r2_results, data.frame(
+        Model = model_name,
+        R_Squared_Within = R2_within,
+        Adj_R_Squared_Within = Adj_R2_within,
+        N_Obs = n_obs,
+        N_Countries = n_countries,
+        Avg_T = avg_T,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  r2_results
+}
+
+ife_within_r2_k1 <- calculate_ife_within_r2(ife_results_k1_list)
+ife_within_r2_k2 <- calculate_ife_within_r2(ife_results_k2_list)
+ife_within_r2_k0 <- calculate_ife_within_r2(ife_results_k0_list)
+
+ife_results_k1 <- ife_results_k1 %>%
+  left_join(ife_within_r2_k1 %>% select(Model, R_Squared_Within, Adj_R_Squared_Within, N_Obs, N_Countries, Avg_T), by = "Model")
+ife_results_k2 <- ife_results_k2 %>%
+  left_join(ife_within_r2_k2 %>% select(Model, R_Squared_Within, Adj_R_Squared_Within, N_Obs, N_Countries, Avg_T), by = "Model")
+ife_results_k0 <- ife_results_k0 %>%
+  left_join(ife_within_r2_k0 %>% select(Model, R_Squared_Within, Adj_R_Squared_Within, N_Obs, N_Countries, Avg_T), by = "Model")
+
+print(ife_results_k1, max = 4000)
+print(ife_results_k2, max = 4000)
+print(ife_results_k0, max = 4000)
+```
+
+```{r IFE Visualisation}
+# IFE Point Estimate Bar Chart (2-year spread, k=1; aligned with quarterly script)
+ife_results_k1_list <- readRDS("ife_results_k1_annual.rds")
+five_models <- grep("^FiveYrSpread_", names(ife_results_k1_list), value = TRUE)
+
+all_coefs <- lapply(five_models, function(nm) {
+  tbl <- as.data.frame(ife_results_k1_list[[nm]]$est.table)
+  tbl$variable <- rownames(tbl)
+  tbl[tbl$variable != "_const", ]
+})
+coefs_df <- bind_rows(all_coefs)
+
+nature_ivs <- c("BII_Weighted_L1", "BHI_Weighted_L1", "EPI_L1", "NDGAIN_L1")
+controls   <- setdiff(unique(coefs_df$variable), nature_ivs)
+
+nature_df <- coefs_df %>%
+  filter(variable %in% nature_ivs) %>%
+  select(variable, Coef, CI.lower, CI.upper, p.value)
+
+control_df <- coefs_df %>%
+  filter(variable %in% controls) %>%
+  group_by(variable) %>%
+  summarise(Coef = mean(Coef), CI.lower = mean(CI.lower),
+            CI.upper = mean(CI.upper), p.value = mean(p.value), .groups = "drop")
+
+ife_plot_df <- bind_rows(nature_df, control_df)
+
+label_map <- c(
+  BII_Weighted_L1 = "Biodiversity Degradation (BII)",
+  BHI_Weighted_L1 = "Biodiversity Degradation (BHI)",
+  EPI_L1 = "Environmental Protection (EPI)",
+  NDGAIN_L1 = "Climate Vulnerability (ND-GAIN)",
+  Inflation = "Inflation",
+  PB = "Primary Balance",
+  CA = "Current Account",
+  FM_Depth = "Capital Market Depth",
+  GDP = "GDP Growth",
+  DebtGDP = "Debt-to-GDP",
+  WGI_RL = "Rule of Law (WGI)",
+  CPI_Food = "Food Price Inflation"
+)
+ife_plot_df$label <- label_map[ife_plot_df$variable]
+ife_plot_df$sig <- ifelse(ife_plot_df$p.value < 0.01, "***",
+                   ifelse(ife_plot_df$p.value < 0.05, "**",
+                   ifelse(ife_plot_df$p.value < 0.1, "*", "")))
+ife_plot_df$group <- ifelse(ife_plot_df$variable %in% nature_ivs,
+                            "Nature / Climate Vulnerability",
+                            "Domestic Macroeconomic Controls")
+ife_plot_df <- ife_plot_df %>%
+  arrange(group, Coef) %>%
+  mutate(label = factor(label, levels = label))
+
+x_min <- -4; x_max <- 2
+x_breaks <- seq(x_min, x_max, by = 0.2)
+
+ggplot(ife_plot_df, aes(x = label, y = Coef, fill = group)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_errorbar(aes(ymin = CI.lower, ymax = CI.upper), width = 0.25, linewidth = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.3) +
+  geom_text(aes(label = sig,
+                y = ifelse(Coef >= 0, CI.upper + 0.05, CI.lower - 0.05)),
+            size = 3.5, vjust = ifelse(ife_plot_df$Coef >= 0, 0, 1)) +
+  coord_flip() +
+  scale_y_continuous(breaks = x_breaks) +
+  scale_fill_manual(values = c("Nature / Climate Vulnerability" = "#2a9d8f",
+                               "Domestic Macroeconomic Controls" = "#264653")) +
+  labs(
+    title = "Interactive Fixed Effects: Impact on 5-Year Sovereign Spreads (Annual Sample)",
+    subtitle = "95% bootstrapped CIs, 1000 replications, k = 1. Variables standardised to one within-country SD. Controls averaged across specifications.",
+    x = NULL, y = "Marginal Effect on 2-Year Yield Spread (pp)",
+    fill = NULL,
+    caption = "Significance: *** p<0.01, ** p<0.05, * p<0.1"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey85", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    plot.caption = element_text(size = 8, color = "grey50"),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+## QIFE
+```{r PCA for Factors}
+# T x N spread matrix at annual frequency (Q1 observations). Filters aligned with quarterly script.
+# HUN, MAR, LTU need to be removed here due to missing 2-year spread data, US serves as baseline for spreads
+AData_PCA <- QData %>%
+  filter(Q == 1) %>%
+  filter(!(ISO3 %in% c("NAM", "TUN", "NGA", "USA", "EGY", "HUN", "MAR", "LTU")) &
+         (Year >= 2000 & Year <= 2020))
+AData_PCA <- AData_PCA %>%
+  filter(!(CountryYear %in% c(
+    "GRC2011", "GRC2012", "GRC2013", "GRC2015",
+    "IRL2015", "IRL2020",
+    "CHN2020",
+    "TUR2000", "TUR2001", "TUR2002", "TUR2003", "TUR2004", "TUR2009",
+    "LKA2015", "LKA2016",
+    "UGA2020",
+    "ZMB2016", "ZMB2020"
+  )))
+
+spread_matrix <- AData_PCA %>%
+  select(ISO3, Year, TwoYrSpread, FiveYrSpread, TenYrSpread) %>%
+  pivot_wider(names_from = ISO3,
+              values_from = c(TwoYrSpread, FiveYrSpread, TenYrSpread)) %>%
+  arrange(Year)
+
+spread_matrix <- as.matrix(spread_matrix[, -1])
+spread_matrix_centered <- scale(spread_matrix, center = TRUE, scale = FALSE)
+nb <- estim_ncpPCA(spread_matrix_centered, ncp.max = 5)
+res.comp <- imputePCA(spread_matrix_centered, ncp = nb$ncp)
+pca_final <- prcomp(res.comp$completeObs, center = TRUE, scale. = FALSE)
+K1 <- pca_final$x[, 1]
+K2 <- pca_final$x[, 2]
+summary(pca_final)$importance
+
+res.comp_alt <- imputePCA(spread_matrix_centered, ncp = 2)
+pca_alt <- prcomp(res.comp_alt$completeObs, center = TRUE, scale = FALSE)
+cor(K1, pca_alt$x[, 1])
+cor(K2, pca_alt$x[, 2])
+summary(pca_alt)$importance
+
+AData_Trimmed <- AData_Final %>%
+  filter(Year >= 2000 & Year <= 2020)
+
+stopifnot(
+  "PCA row count does not match unique years in AData_Trimmed" =
+    length(unique(AData_Trimmed$Year)) == nrow(pca_alt$x)
+)
+
+PCA_factor_df <- data.frame(
+  Year = sort(unique(AData_Trimmed$Year)),
+  K1 = pca_alt$x[, 1],
+  K2 = pca_alt$x[, 2]
+)
+
+AData_Final <- AData_Final %>%
+  left_join(PCA_factor_df, by = "Year")
+
+# Simple correlations of factors with global macro variables
+cor(AData_Final$K2, AData_Final$Oil, use = "pairwise.complete.obs")
+cor(AData_Final$K2, AData_Final$Commodity, use = "pairwise.complete.obs")
+cor(AData_Final$K2, AData_Final$VIX, use = "pairwise.complete.obs")
+cor(AData_Final$K2, AData_Final$FFR, use = "pairwise.complete.obs")
+cor(AData_Final$K2, AData_Final$GBI_EM_Global_USD, use = "pairwise.complete.obs")
+cor(AData_Final$K1, AData_Final$GFBONDRM, use = "pairwise.complete.obs")
+cor(AData_Final$K1, AData_Final$MSCI, use = "pairwise.complete.obs")
+cor(AData_Final$K2, AData_Final$GFBONDRM, use = "pairwise.complete.obs")
+cor(AData_Final$K2, AData_Final$MSCI, use = "pairwise.complete.obs")
+
+```
+
+```{r Linear Quantile Mixture Model}
+# Annual robustness: no interpolation; Q1 observations only.
+AData_QIFE <- as.data.frame(AData_Final)
+AData_QIFE$ISO3 <- as.character(AData_QIFE$ISO3)
+
+dependent_vars   <- c("TwoYrSpread", "FiveYrSpread", "TenYrSpread")
+independent_vars <- c("BII_Weighted", "BHI_Weighted", "EPI", "NDGAIN")
+controls         <- c("Inflation", "PB", "CA", "GDP", "DebtGDP",
+                      "FM_Depth", "WGI_RL", "CPI_Food")
+quantiles        <- c(0.1, 0.25, 0.5, 0.75, 0.9)
+num_factors      <- c(1, 2)
+R_boot           <- 500
+
+# Function runs QIFE for all specifications and stores results in a nested list: qife_results[[dv]][[iv]][[k]][[quantile]]
+run_qife_grid <- function(n_groups) {
+  results <- list()
+  for (dv in dependent_vars) {
+    results[[dv]] <- list()
+    dv_abbrev <- gsub("YrSpread", "", dv)
+
+    for (iv in independent_vars) {
+      results[[dv]][[iv]] <- list()
+
+      for (k in num_factors) {
+        results[[dv]][[iv]][[paste0("k", k)]] <- list()
+        randomTC_formula <- if (k == 1) ~ 1 + K1 else ~ 1 + K1 + K2
+
+        for (qtl in quantiles) {
+          iv_abbrev <- gsub("_Weighted_L1|_L1", "", iv)
+          model_name <- paste0(dv_abbrev, "_", iv_abbrev, "_K", k, "_G", n_groups,
+                               "_q", gsub("\\.", "", as.character(qtl)))
+          message(paste("Running:", model_name))
+
+          formula_obj <- as.formula(paste(dv, "~", iv, "+",
+                                          paste(controls, collapse = " + ")))
+
+          fit <- tryCatch({
+            lqmix(
+              formula = formula_obj,
+              randomTC = randomTC_formula,
+              group = "ISO3",
+              time  = "Year",
+              G = n_groups,
+              data = AData_QIFE,
+              qtl  = qtl,
+              se   = TRUE,
+              R    = R_boot,
+              verbose = TRUE
+            )
+          }, error = function(e) {
+            message(paste("Error in", model_name, ":", e$message)); NULL
+          })
+
+          if (!is.null(fit)) {
+            results[[dv]][[iv]][[paste0("k", k)]][[as.character(qtl)]] <- fit
+            message(paste("Completed:", model_name))
+          } else {
+            message(paste("Failed:", model_name))
+          }
+        }
+      }
+    }
+  }
+  results
+}
+
+# Run QIFE for factors 1, 2, all quantiles, EVs and DVs, but separately for each number of groups (G=3, 4, or 5)
+qife_results_G3 <- run_qife_grid(3)
+qife_results_G4 <- run_qife_grid(4)
+qife_results_G5 <- run_qife_grid(5)
+
+
+# Save accordingly
+saveRDS(qife_results_G3, file = "qife_results_annual_G3.rds")
+saveRDS(qife_results_G4, file = "qife_results_annual_G4.rds")
+saveRDS(qife_results_G5, file = "qife_results_annual_G5.rds")
+
+# Reload helper (use after a full run, or skip the loops above)
+# qife_results_G3 <- readRDS("qife_results_annual_G3.rds")
+# qife_results_G4 <- readRDS("qife_results_annual_G4.rds")
+# qife_results_G5 <- readRDS("qife_results_annual_G5.rds")
+
+extract_qife_coefficients <- function(qife_results_list, g = NA) {
+  all_coefs <- list()
+  for (dv in names(qife_results_list)) {
+    for (iv in names(qife_results_list[[dv]])) {
+      for (k_nm in names(qife_results_list[[dv]][[iv]])) {
+        for (qtl_str in names(qife_results_list[[dv]][[iv]][[k_nm]])) {
+          model <- qife_results_list[[dv]][[iv]][[k_nm]][[qtl_str]]
+          if (is.null(model)) next
+
+          model_summary <- tryCatch(summary(model), error = function(e) NULL)
+          coef_table <- NULL
+          if (!is.null(model_summary) && !is.null(model_summary$fix)) {
+            coef_table <- model_summary$fix
+          }
+          if (is.null(coef_table) && !is.null(model$betaf) && !is.null(model$se.betaf)) {
+            coef_table <- cbind(Estimate = model$betaf, `St.Error` = model$se.betaf)
+          }
+          if (is.null(coef_table)) next
+
+          if (is.vector(coef_table)) {
+            coef_table <- matrix(coef_table, ncol = 1,
+                                 dimnames = list(names(coef_table), "Estimate"))
+          }
+
+          sigma_e <- NA
+          if (!is.null(model_summary) && !is.null(model_summary$sigma.e)) {
+            sigma_e <- model_summary$sigma.e
+          } else if (!is.null(model$sigma.e)) {
+            sigma_e <- model$sigma.e
+          }
+
+          if (iv %in% rownames(coef_table)) {
+            all_coefs[[length(all_coefs) + 1]] <- data.frame(
+              dependent   = dv,
+              independent = iv,
+              quantile    = as.numeric(qtl_str),
+              k           = as.numeric(gsub("^k|^r", "", k_nm)),
+              G           = g,
+              estimate    = coef_table[iv, 1],
+              std.error   = if (ncol(coef_table) >= 2) coef_table[iv, 2] else NA,
+              p.value     = if (ncol(coef_table) >= 4) coef_table[iv, 4] else NA,
+              sigma.e     = sigma_e,
+              stringsAsFactors = FALSE
+            )
+          }
+        }
+      }
+    }
+  }
+  if (length(all_coefs) == 0) {
+    warning("No coefficients extracted from qife_results")
+    return(data.frame())
+  }
+  do.call(rbind, all_coefs)
+}
+
+# Set G of interest for tables/plots (headline spec: G = 4)
+qife_results <- qife_results_G5 # Also change G here
+
+qife_coefs_df <- extract_qife_coefficients(qife_results, g = 5) # CHANGE G HERE
+#saveRDS(qife_coefs_df, file = "qife_coefs_df_annual_G3.rds")
+#saveRDS(qife_coefs_df, file = "qife_coefs_df_annual_G4.rds")
+#saveRDS(qife_coefs_df, file = "qife_coefs_df_annual_G5.rds")
+
+# Visualisation of QIFE results
+if (nrow(qife_coefs_df) == 0) {
+  warning("Could not extract coefficients from qife_results.")
+} else {
+  qife_coefs_df <- qife_coefs_df %>%
+    dplyr::mutate(
+      p.value = ifelse(is.na(p.value) & !is.na(std.error) & std.error > 0,
+                       2 * (1 - pnorm(abs(estimate / std.error))), p.value),
+      significance = case_when(
+        !is.na(p.value) & p.value < 0.01 ~ "***",
+        !is.na(p.value) & p.value < 0.05 ~ "**",
+        !is.na(p.value) & p.value < 0.1  ~ "*",
+        TRUE ~ ""
+      ),
+      dependent_label = factor(dependent,
+        levels = c("TwoYrSpread", "FiveYrSpread", "TenYrSpread"),
+        labels = c("2-Year Spread", "5-Year Spread", "10-Year Spread")),
+      independent_label = factor(
+        dplyr::case_when(
+          grepl("BII_Weighted", independent) ~ "Biodiversity Degradation (BII)",
+          grepl("BHI_Weighted", independent) ~ "Biodiversity Degradation (BHI)",
+          grepl("^EPI", independent) ~ "Environmental Performance Index",
+          grepl("NDGAIN", independent) ~ "Climate Vulnerability (ND-GAIN)",
+          TRUE ~ independent
+        ),
+        levels = c("Biodiversity Degradation (BII)", "Biodiversity Degradation (BHI)",
+                   "Environmental Performance Index", "Climate Vulnerability (ND-GAIN)")
+      )
+    )
+
+  y_limits <- c(-0.3, 1.2)
+
+  plot_qife <- function(data, k) {
+    if (nrow(data) == 0) { warning(paste("No data for k=", k)); return(invisible(NULL)) }
+
+    sigma_labels <- data %>%
+      dplyr::group_by(dependent_label, independent_label) %>%
+      dplyr::summarise(
+        label = paste0("\u03c3 = ", sprintf("%.3f", mean(sigma.e, na.rm = TRUE))),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(x = 0.9, y = -Inf)
+
+    ggplot(data, aes(x = quantile, y = estimate)) +
+      geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+      geom_ribbon(aes(ymin = estimate - 1.96 * std.error,
+                      ymax = estimate + 1.96 * std.error), fill = "grey", alpha = 0.3) +
+      geom_line(color = "blue", linewidth = 0.8) +
+      geom_point(color = "red", size = 2) +
+      geom_text(aes(label = significance), vjust = -0.5, size = 3) +
+      geom_text(data = sigma_labels, aes(x = x, y = y, label = label),
+                hjust = 1, vjust = -0.5, size = 2.5, color = "darkgray", fontface = "italic") +
+      facet_grid(dependent_label ~ independent_label) +
+      scale_y_continuous(limits = y_limits) +
+      labs(
+        title    = "Asymmetric Impact of Nature-Related Financial Vulnerability (Annual)",
+        subtitle = paste0("Quantile IFE with ", k, " PCA factor", if (k > 1) "s" else "",
+                          ". Rightmost points represent high borrowing cost countries."),
+        x = "Quantile", y = "Marginal Effect on Sovereign Bond Yield Spread (pp)",
+        caption  = "Significance: *** p<0.01, ** p<0.05, * p<0.1. 95% confidence intervals from block-bootstrapped standard errors with 500 replications per quantile. \u03c3 = mean standard deviation of error terms. 57 countries, annual, 2000-2020."
+      ) +
+      theme_minimal() +
+      theme(
+        strip.text       = element_text(face = "bold"),
+        strip.background = element_rect(fill = "lightgray", color = NA),
+        panel.spacing    = unit(1, "lines"),
+        plot.title       = element_text(size = 12, face = "bold"),
+        plot.subtitle    = element_text(size = 10),
+        plot.caption     = element_text(size = 8, color = "grey50"),
+        axis.title       = element_text(size = 10),
+        axis.text        = element_text(size = 9)
+      )
+  }
+
+  if (!"k" %in% names(qife_coefs_df) && "r" %in% names(qife_coefs_df)) {
+    qife_coefs_df$k <- qife_coefs_df$r
+  }
+  print(plot_qife(dplyr::filter(qife_coefs_df, k == 2), k = 2))
+  print(plot_qife(dplyr::filter(qife_coefs_df, k == 1), k = 1))
+}
+```

@@ -1,0 +1,1910 @@
+---
+title: "Paper 1 Quarterly"
+author: "Alexander Wollenweber"
+date: "2025-05-19"
+output: 
+  html_document: 
+    theme: readable
+    fig_width: 8
+    fig_height: 6
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)# Change to own directory
+knitr::opts_knit$set(root.dir = "~/Documents/DPhil - Oxford/Research/Paper 1")
+setwd("~/Documents/DPhil - Oxford/Research/Paper 1")
+options(scipen = 999)
+```
+
+## Load Quarterly Data, Libraries and Functions
+```{r Load Data, Libraries and Functions}
+rm(list = ls())
+
+# Install all required packages upfront
+packages <- c("dplyr", "readr", "zoo", "readxl", "tidyr", "ggplot2", "lubridate", "splines", "psych", "ggrepel", "plm", "gt", "kableExtra", "flextable", "ggcorrplot", "Hmisc", "quantreg", "ggeffects", "broom", "rnaturalearth", "rnaturalearthdata", "sf", "olsrr", "performance", "see", "lmtest", "sandwich", "pqrfe", "wesanderson", "interactions", "stargazer", "sjPlot", "sjmisc", "sjlabelled", "texreg", "lmtest", "panelvar", "clubSandwich", "quantreg", "dynamite","missMDA", "gsynth", "lqmix", "tseries")
+
+# Install packages if not already installed
+new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+
+QData <- read_excel("QData.xlsx", sheet = "Master Data")
+```
+
+```{r Set Interpolation Variables}
+
+# Columns to interpolate
+Columns_to_interpolate <- c("Vulnerability", "BII", "BDH", "BHI", "RNC/TC Ratio", "WBNCR", "WBTC","BHISpecies", "BHIAvg", 
+ "PB", "DebtGDP", "FM_Depth", "WGI_CC", "WGI_GE", "WGI_RL", "WGI_RQ",
+ "ITwoYrSpread", "IFiveYrSpread", "ITenYrSpread") # Spreads interpolated only for PCA robustness check
+
+# Create numeric time variable ("TimeNumeric") for interpolation and duplicate spread columns
+QData <- QData %>%
+  mutate(
+    ITwoYrSpread = TwoYrSpread, # Robustness check for PCA factors, we interpolate missing values of the spread series
+    IFiveYrSpread = FiveYrSpread, # The interpolated values are not used throughout the analysis otherwise
+    ITenYrSpread = TenYrSpread,
+    Year = as.numeric(Year),
+    Q = as.numeric(Q),
+    TimeNumeric = Year + (Q - 1) / 4
+  )
+
+# Convert YearQtr to yearquarter class (zoo) for plotting
+QData$YearQtr <- as.yearqtr(QData$YearQtr)
+```
+
+```{r Duplicate Data Check}
+# Identify duplicate time points per country.
+duplicate_rows <- QData %>%
+  group_by(ISO3, TimeNumeric) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  filter(n > 1)
+
+if (nrow(duplicate_rows) > 0) {
+  cat("Found duplicate time points for the following countries:\n")
+  print(knitr::kable(duplicate_rows, caption = "Duplicate Time Points by Country"))
+} else {
+  cat("No duplicate time points found in the dataset.\n")
+}
+```
+
+```{r Compute EPI: Biodiversity and Habitat Sub-index}
+Nature_Data <- read_excel("QData.xlsx", sheet = "Nature")
+
+# EPI Biodiversity & Habitat Sub-index (BDH): weighted average of 8 sub-indicators.
+# Raw weights from the most recent Environmental Performance Index (EPI) methodology note from 2024, normalised to sum to 1:
+#   MKP  Marine KBA Protection          0.12  -> 0.146
+#   MHP  Marine Habitat Protection       0.12  -> 0.146
+#   MPE  Marine Protection Stringency    0.02  -> 0.024
+#   SPI  Species Protection Index        0.16  -> 0.195
+#   TBN  Terrestrial Biome Protection    0.10  -> 0.122
+#   TKP  Terrestrial KBA Protection      0.10  -> 0.122
+#   RLI  Red List Index                  0.12  -> 0.146
+#   SHI  Species Habitat Index           0.08  -> 0.098
+
+bdh_raw_weights <- c(MKP = 0.12, MHP = 0.12, MPE = 0.02, SPI = 0.16,
+                     TBN = 0.10, TKP = 0.10, RLI = 0.12, SHI = 0.08)
+bdh_norm_weights <- bdh_raw_weights / sum(bdh_raw_weights)
+
+Nature_Data <- Nature_Data %>%
+  rowwise() %>%
+  mutate(
+    BDH_computed = {
+      vals <- c_across(all_of(names(bdh_raw_weights)))
+      avail <- !is.na(vals)
+      if (sum(avail) == 0) NA_real_
+      else sum(vals[avail] * bdh_norm_weights[avail]) / sum(bdh_norm_weights[avail])
+    }
+  ) %>%
+  ungroup()
+
+# Validation against existing Excel BDH (where all 8 present, exact match expected)
+validation_bdh <- Nature_Data %>%
+  filter(!is.na(BDH) & !is.na(BDH_computed)) %>%
+  mutate(diff = abs(BDH - BDH_computed))
+cat("BDH validation: max diff =", max(validation_bdh$diff),
+    "| n =", nrow(validation_bdh), "\n")
+
+Nature_Data <- Nature_Data %>%
+  mutate(BDH = coalesce(BDH, BDH_computed)) %>%
+  select(-BDH_computed)
+
+cat("BDH coverage:", sum(!is.na(Nature_Data$BDH)), "of", nrow(Nature_Data), "rows\n")
+```
+
+## Interpolation
+
+```{r Interpolation}
+# Function to interpolate missing values for a country's time series
+interpolate_country_data <- function(country_data, method = "spline") {
+  if (nrow(country_data) <= 1) return(country_data)  # Cannot interpolate with just one point
+  # De-duplicate the data to handle cases where multiple entries exist for the same time point
+  country_data <- country_data %>%
+    distinct(TimeNumeric, .keep_all = TRUE)
+  # Get time range for a given country
+  time_range <- range(country_data$TimeNumeric, na.rm = TRUE)
+  # Create sequence of quarters as numeric values
+  all_times <- seq(from = time_range[1], to = time_range[2], by = 0.25)
+  # Create complete time sequence dataframe
+  complete_seq <- data.frame(
+    ISO3 = unique(country_data$ISO3),
+    TimeNumeric = all_times
+  )
+  # Calculate Year and Quarter from TimeNumeric
+  complete_seq <- complete_seq %>%
+    mutate(
+      Year = floor(TimeNumeric),
+      Q = (round((TimeNumeric - Year) * 4) + 1),
+      YearQtr = as.yearqtr(paste0(Year, " Q", Q))
+    )
+  # Merge with existing data
+  merged_data <- left_join(complete_seq, country_data, by = c("ISO3", "TimeNumeric"))
+  # If there's no direct match on TimeNumeric, join by ISO3, Year, and Q
+  if (all(is.na(merged_data$`Country Name`))) {
+    merged_data <- left_join(
+      complete_seq, 
+      country_data, 
+      by = c("ISO3", "Year", "Q")
+    )
+  }
+  
+  # For each variable to interpolate, track the min and max times where real data exists to avoid extrapolation.
+  var_bounds <- list()
+  
+  # List of numeric variables to interpolate (excluding identifier columns)
+  numeric_vars <- names(country_data)[sapply(country_data, is.numeric)]
+  numeric_vars <- setdiff(numeric_vars, c("Year", "Q", "TimeNumeric"))
+  
+  # First determine valid bounds for each variable to prevent extrapolation
+  for (var in numeric_vars) {
+    # Skip if there are fewer than 2 non-NA values
+    if (sum(!is.na(merged_data[[var]])) < 2) next
+    
+    # Find the min and max TimeNumeric where actual data exists
+    valid_times <- merged_data$TimeNumeric[!is.na(merged_data[[var]])]
+    var_bounds[[var]] <- range(valid_times)
+  }
+  
+  # Apply interpolation to each numeric variable
+  for (var in numeric_vars) {
+    # Skip if there are fewer than 2 non-NA values
+    if (sum(!is.na(merged_data[[var]])) < 2) next
+    
+    # Get the time bounds for this variable
+    bounds <- var_bounds[[var]]
+    
+    # Only interpolate within the bounds of actual data points
+    mask <- merged_data$TimeNumeric >= bounds[1] & merged_data$TimeNumeric <= bounds[2]
+    x <- merged_data$TimeNumeric[mask]
+    y <- merged_data[[var]][mask]
+    
+    if (method == "linear") {
+      # Linear interpolation
+      interp_values <- approx(x[!is.na(y)], y[!is.na(y)], xout = x, method = "linear")$y # calls native piecewise linear interpolation function of R
+    } else if (method == "spline") {
+      # Cubic spline interpolation
+      if (sum(!is.na(y)) >= 4) {  # Need at least 4 points for cubic spline
+        interp_values <- spline(x[!is.na(y)], y[!is.na(y)], xout = x)$y # calls native cubic spline interpolation function of R
+      } else {
+        # Fall back to linear if not enough points
+        interp_values <- approx(x[!is.na(y)], y[!is.na(y)], xout = x, method = "linear")$y
+      }
+    }
+    
+    # Only update values within the bounds
+    merged_data[[var]][mask] <- interp_values
+  }
+  
+  # Fill in missing identifier columns
+  id_cols <- c("Country Name", "Crncy Name", "CountryYear", "CountryYrQtr")
+  for (col in id_cols) {
+    if (col %in% names(merged_data)) {
+      # Take the first non-NA value for each ID column
+      first_value <- na.omit(unique(country_data[[col]]))[1]
+      merged_data[[col]][is.na(merged_data[[col]])] <- first_value
+    }
+  }
+  
+  # Compute Countryear and CountryYrQtr if they don't exist
+  if ("CountryYear" %in% names(merged_data)) {
+    merged_data$CountryYear <- paste0(merged_data$ISO3, merged_data$Year)
+  }
+  
+  if ("CountryYrQtr" %in% names(merged_data)) {
+    merged_data$CountryYrQtr <- paste0(merged_data$ISO3, merged_data$Year, "Q", merged_data$Q)
+  }
+  
+  return(merged_data)
+}
+
+# Applies interpolation to all countries and merges results back into a copy of qdata
+run_interpolation <- function(qdata, method = "spline") {
+  countries <- unique(qdata$ISO3)
+
+  interp_list <- lapply(setNames(countries, countries), function(iso) {
+    dat <- qdata %>% filter(ISO3 == iso)
+    if (nrow(dat) == 0) return(NULL)
+    interpolate_country_data(dat, method = method)
+  })
+  interp_list <- Filter(Negate(is.null), interp_list)
+
+  processed <- lapply(interp_list, function(df) {
+    if ("YearQtr" %in% names(df)) df$YearQtr <- as.character(df$YearQtr)
+    df <- df[, !grepl("\\.x$|\\.y$", names(df))]
+    keep <- unique(c("ISO3", "Country Name", "Year", "Q", "TimeNumeric",
+                     intersect(names(df), Columns_to_interpolate)))
+    df[, intersect(keep, names(df))]
+  })
+
+  all_interp <- do.call(rbind, processed)
+  rownames(all_interp) <- NULL
+  if (!("Year" %in% names(all_interp)) || !("Q" %in% names(all_interp))) {
+    all_interp <- all_interp %>%
+      mutate(Year = floor(TimeNumeric), Q = round((TimeNumeric - Year) * 4) + 1)
+  }
+  all_interp <- all_interp %>%
+    mutate(YearQtr = as.yearqtr(paste0(Year, " Q", Q)))
+
+  out <- qdata
+  for (col in Columns_to_interpolate) {
+    if (!(col %in% names(all_interp))) next
+    for (iso in countries) {
+      ci <- all_interp %>% filter(ISO3 == iso) %>% select(TimeNumeric, !!sym(col))
+      if (nrow(ci) == 0 || all(is.na(ci[[col]]))) next
+      idx <- which(out$ISO3 == iso & is.na(out[[col]])) # Only targets rows where the value is already NA
+      for (i in idx) { # for each missing value, find the corresponding value in the interpolated data frame
+        j <- match(out$TimeNumeric[i], ci$TimeNumeric)
+        if (!is.na(j) && !is.na(ci[[col]][j])) out[[col]][i] <- ci[[col]][j]
+      }
+    }
+  }
+
+  # Append newly-created quarters present in interpolated output but absent from original, to retain original observations and only add interpolated values. 
+  all_keys  <- all_interp %>% select(ISO3, TimeNumeric) %>% distinct()
+  orig_keys <- qdata      %>% select(ISO3, TimeNumeric) %>% distinct()
+  missing_q <- anti_join(all_keys, orig_keys, by = c("ISO3", "TimeNumeric"))
+  if (nrow(missing_q) > 0) {
+    new_rows <- all_interp %>% inner_join(missing_q, by = c("ISO3", "TimeNumeric"))
+    for (col_add in setdiff(names(out), names(new_rows))) new_rows[[col_add]] <- NA
+    new_rows <- new_rows[, names(out), drop = FALSE]
+    out <- bind_rows(out, new_rows) %>% arrange(ISO3, TimeNumeric)
+  }
+
+  out
+}
+```
+
+```{r Apply Interpolation}
+QData_I        <- run_interpolation(QData, method = "spline")
+QData_I_linear <- run_interpolation(QData, method = "linear")
+
+# Report fill rates
+original_non_na <- sum(!is.na(QData[Columns_to_interpolate]))
+spline_non_na   <- sum(!is.na(QData_I[Columns_to_interpolate]))
+cat("Data points added by spline interpolation:",
+    round((spline_non_na - original_non_na) / spline_non_na * 100, 2), "%\n")
+
+filled_total <- 0
+for (col in Columns_to_interpolate) {
+  if (!(col %in% names(QData)) || !(col %in% names(QData_I))) next
+  filled <- sum(is.na(QData[[col]])) - sum(is.na(QData_I[[col]]))
+  if (filled > 0) {
+    cat("Filled", filled, "values in", col, "\n")
+    filled_total <- filled_total + filled
+  }
+}
+cat("Total values filled:", filled_total, "\n")
+```
+
+```{r Linear-Cubic 50%}
+# Q1: use original value; Q2-Q4: average of cubic-spline and linear estimates
+QData_I_CL <- QData_I
+
+for (col_name in Columns_to_interpolate) {
+  if (!(col_name %in% names(QData_I_CL)) ||
+      !(col_name %in% names(QData_I_linear)) ||
+      !(col_name %in% names(QData))) next
+
+  original_data_subset <- QData %>%
+    select(ISO3, TimeNumeric, original_val = !!sym(col_name)) %>%
+    filter(!is.na(original_val)) %>%
+    distinct(ISO3, TimeNumeric, .keep_all = TRUE)
+
+  linear_data_subset <- QData_I_linear %>%
+    select(ISO3, TimeNumeric, linear_val = !!sym(col_name)) %>%
+    distinct(ISO3, TimeNumeric, .keep_all = TRUE)
+
+  QData_I_CL <- QData_I_CL %>%
+    left_join(original_data_subset, by = c("ISO3", "TimeNumeric")) %>%
+    left_join(linear_data_subset,   by = c("ISO3", "TimeNumeric")) %>%
+    mutate(
+      !!col_name := case_when(
+        Q == 1 & !is.na(original_val)                                        ~ original_val,
+        Q == 1 &  is.na(original_val)                                        ~ .data[[col_name]],
+        Q %in% 2:4 & !is.na(.data[[col_name]]) & !is.na(linear_val)         ~ linear_val + ((.data[[col_name]] - linear_val) / 2),
+        Q %in% 2:4 & !is.na(.data[[col_name]]) &  is.na(linear_val)         ~ .data[[col_name]],
+        Q %in% 2:4 &  is.na(.data[[col_name]]) & !is.na(linear_val)         ~ linear_val,
+        TRUE                                                                  ~ .data[[col_name]]
+      )
+    ) %>%
+    select(-any_of(c("original_val", "linear_val")))
+}
+``` 
+
+```{r Comparing Interpolation Methods}
+# Diagnostic: plots cubic-spline, linear, and cubic-linear series against original data point
+plot_enhanced <- function(country_code, variable_name) {
+  original_df <- QData %>%
+    filter(ISO3 == country_code, !is.na(!!sym(variable_name))) %>%
+    select(TimeNumeric, value = !!sym(variable_name))
+
+  if (!exists("QData_I") || !(variable_name %in% names(QData_I)))
+    stop("QData_I not found or missing variable: ", variable_name)
+  cubic_line_df <- QData_I %>%
+    filter(ISO3 == country_code) %>%
+    select(TimeNumeric, value_cubic = !!sym(variable_name)) %>%
+    filter(!is.na(value_cubic))
+
+  if (!exists("QData_I_linear") || !(variable_name %in% names(QData_I_linear)))
+    stop("QData_I_linear not found or missing variable: ", variable_name)
+  linear_line_df <- QData_I_linear %>%
+    filter(ISO3 == country_code) %>%
+    select(TimeNumeric, value_linear = !!sym(variable_name)) %>%
+    filter(!is.na(value_linear))
+
+  if (!exists("QData_I_CL") || !(variable_name %in% names(QData_I_CL)))
+    stop("QData_I_CL not found or missing variable: ", variable_name)
+  cubic_linear_line_df <- QData_I_CL %>%
+    filter(ISO3 == country_code) %>%
+    select(TimeNumeric, value_cubic_linear = !!sym(variable_name)) %>%
+    filter(!is.na(value_cubic_linear))
+
+  all_times <- unlist(list(original_df$TimeNumeric, cubic_line_df$TimeNumeric, linear_line_df$TimeNumeric))
+  if (length(all_times) == 0 || all(is.na(all_times))) {
+    min_time <- 1990; max_time <- 2020
+  } else {
+    min_time <- floor(min(all_times, na.rm = TRUE))
+    max_time <- ceiling(max(all_times, na.rm = TRUE))
+  }
+
+  ggplot() +
+    geom_line(data = cubic_line_df,        aes(x = TimeNumeric, y = value_cubic,        color = "Cubic Spline"),   linewidth = 0.7) +
+    geom_line(data = linear_line_df,        aes(x = TimeNumeric, y = value_linear,        color = "Linear"),         linewidth = 0.7, linetype = "dashed") +
+    geom_line(data = cubic_linear_line_df,  aes(x = TimeNumeric, y = value_cubic_linear,  color = "Cubic-Linear"),   linewidth = 0.7, linetype = "dotted") +
+    geom_point(data = original_df, aes(x = TimeNumeric, y = value), color = "black", size = 2.5, shape = 1) +
+    scale_color_manual(values = c("Cubic Spline" = "blue", "Linear" = "green", "Cubic-Linear" = "red")) +
+    labs(title    = paste(variable_name, "for", country_code, "- Interpolation Comparison"),
+         subtitle = "Black circles: original data points",
+         x = "Year", y = variable_name, color = "Interpolation Method") +
+    theme_minimal() +
+    scale_x_continuous(breaks = seq(min_time, max_time, by = ifelse(max_time - min_time > 20, 2, 1)),
+                       limits = c(min_time, max_time))
+}
+
+example_country <- unique(QData$ISO3)[8] # select country here
+plot_enhanced(example_country, "BII") # select variable here
+
+```
+
+## Mutate Variables
+
+```{r Rename and Mutate Variables}
+QData_I_CL <- QData_I_CL %>%
+  mutate(
+    Inv_BII = 100 - BII,
+    Inv_BDH = 100 - BDH,
+    ln_WBRNC = log(WBNCR),
+    Inv_BHI = 100 - BHI,
+    Inv_BHISpecies = 100 - BHISpecies,
+    Inv_BHIAvg = 100 - BHIAvg,
+    `BII_Vul_TC` = Inv_BII * `RNC/TC Ratio`,
+    `BHIAvg_Vul` = Inv_BHIAvg * `RNC/TC Ratio`,
+    `BHI_Vul` = Inv_BHI * `RNC/TC Ratio`,
+    `BHISpecies_Vul` = Inv_BHISpecies * `RNC/TC Ratio`,
+    `RNC/TC` = WBNCR/WBTC,
+    BII_Vul_TC_Test = Inv_BII * `RNC/TC`, # Near-identical to the interpolated version
+    DebtGDP = DebtGDP/100
+  )
+
+QData_I_CL <- QData_I_CL %>%
+  rename(GDP = `WB GDP`,  ChinnIto = `Chinn-Ito`, 
+    EPI = Inv_BDH, NDGAIN = Vulnerability,
+    WB_Classification = `WB Classification`, IMF_Classification = `IMF Classification`)
+
+
+# Re-scaling the weighted indices to 0-100 scale
+QData_I_CL <- QData_I_CL %>%
+  mutate(
+    # Get the maximum values of the weighted indices
+    max_BII_Vul_TC = max(BII_Vul_TC, na.rm = TRUE),
+    max_BHIAvg_Vul = max(BHIAvg_Vul, na.rm = TRUE),
+    
+    # Re-scale to 0-100
+    BII_Weighted = (BII_Vul_TC / max_BII_Vul_TC) * 100,
+    BHI_Weighted = (BHIAvg_Vul / max_BHIAvg_Vul) * 100,
+    
+    # Remove the temporary maximum columns
+    max_BII_Vul_TC = NULL,
+    max_BHIAvg_Vul = NULL, 
+    
+    # Adjust the WGI indices
+    WGI_CC = WGI_CC + 2.5,
+    WGI_GE = WGI_GE + 2.5,
+    WGI_RL = WGI_RL + 2.5,
+    # Create combined institutional quality index as average of adjusted indices
+    WGI_IQ = (WGI_CC + WGI_GE + WGI_RL) / 3
+  )
+
+# Standardise all main regression variables to unit within-country variance to facilitate cross-coefficient interpretation.
+vars_to_standardize <- c(
+  # Environmental / climate indicators
+  "BII_Weighted", "BHI_Weighted", "EPI", "NDGAIN",
+  # Macro controls used in IFE / QIFE
+  "Inflation", "PB", "CA", "GDP", "DebtGDP",
+  "FM_Depth", "WGI_RL", "CPI_Food"
+)
+
+# Calculate the within-country SD for each variable (demean by ISO3, then SD)
+within_sds_map <- QData_I_CL %>%
+  group_by(ISO3) %>%
+  mutate(across(all_of(vars_to_standardize), ~ . - mean(., na.rm = TRUE))) %>%
+  ungroup() %>%
+  summarise(across(all_of(vars_to_standardize), ~ sd(., na.rm = TRUE))) %>%
+  as.list()
+
+# Divide each variable by its within-country SD (unit within-country variance)
+QData_I_CL <- QData_I_CL %>%
+  mutate(across(all_of(vars_to_standardize),
+                ~ . / within_sds_map[[cur_column()]]))
+
+# Lag generation
+QData_I_CL <- QData_I_CL %>%
+      group_by(ISO3) %>%
+      mutate(
+        BII_Weighted_L1 = dplyr::lag(BII_Weighted, 1),
+        BII_Weighted_L2 = dplyr::lag(BII_Weighted, 2),
+        BHI_Weighted_L1 = dplyr::lag(BHI_Weighted, 1),
+        BHI_Weighted_L2 = dplyr::lag(BHI_Weighted, 2),
+        EPI_L1 = dplyr::lag(EPI, 1),
+        EPI_L2 = dplyr::lag(EPI, 2),
+        NDGAIN_L1 = dplyr::lag(NDGAIN, 1),
+        NDGAIN_L2 = dplyr::lag(NDGAIN, 2),
+        ER_t1 = dplyr::lead(ER, n = 1)
+      ) %>%
+      ungroup()
+
+## Consider saving as csv at this stage
+
+## Remove idiosyncratic outlier events (severe financial crisis, civil war, etc.) and observations with above-threshold leverage/studentized residuals.
+QData_I_CL_clean <- QData_I_CL %>%
+  filter(!(CountryYrQtr %in% c("GRC2010Q4","GRC2011Q1", "GRC2011Q2", "GRC2011Q3", "GRC2011Q4", "GRC2012Q1", "GRC2012Q2","GRC2012Q3", "GRC2012Q4","GRC2013Q1","GRC2013Q2","GRC2013Q3","GRC2013Q4", "GRC2015Q1", "GRC2015Q2", "IRL2015Q1", "IRL2016Q4", "IRL2017Q2","IRL2019Q2", "IRL2019Q4", "IRL2020Q1", "CHN2020Q1", "TUR2000Q1","TUR2000Q2","TUR2000Q3","TUR2000Q4", "TUR2001Q1", "TUR2001Q2","TUR2001Q3","TUR2001Q4","TUR2002Q1","TUR2002Q2" ,"TUR2002Q3", "TUR2002Q4", "TUR2003Q1","TUR2003Q2","TUR2003Q3","TUR2003Q4","TUR2004Q1","TUR2004Q2","TUR2004Q3","TUR2004Q4","TUR2008Q2","TUR2009Q1","TUR2018Q2","TUR2018Q3","TUR2018Q4" , "IDN2005Q4","IND2009Q3", "BGR2005Q4","BGR2007Q4","UGA2019Q4", "UGA2020Q1", "LKA2015Q1", "LKA2016Q1","ZMB2015Q4", "ZMB2016Q1","ZMB2016Q2","ZMB2016Q3","ZMB2019Q2","ZMB2019Q3","ZMB2019Q4","ZMB2020Q1","ZMB2020Q2","ZMB2020Q3","ZMB2020Q4")))
+QData_I_CL_clean <- QData_I_CL_clean %>%
+  filter(!(ISO3 %in% c("NAM","NGA","TUN"))) 
+QData_Final <- QData_I_CL_clean # Change to preferred interpolation method. 
+
+# NGA, TUN & NAM only have spreads for one matrurity, removing these for consistent comparison (otherwise can't compare 10-5-2 yr specifications). The PCA on cross-section of spreads to obtain factors for QIFE would otherwise also fail. 
+# Optionally, they can be included for the 10Y results.
+```
+
+## Data Inspection and Outliers
+
+```{r Histograms}
+## Histograms 
+## Of Yield Spreads
+ggplot(QData_I_CL %>%  select(TenYrSpread, FiveYrSpread, TwoYrSpread) %>%
+       pivot_longer(everything(), names_to = "Spread", values_to = "Value")) +
+  geom_histogram(aes(x = Value), binwidth = function(x) diff(range(x, na.rm = TRUE))/30, fill = "steelblue", color = "black",  alpha = 0.7) +
+  facet_wrap(~Spread, scales = "free") + theme_minimal() +
+  labs( title = "Distribution of Sovereign Bond Spreads",
+    x = "Value",
+    y = "Frequency" )
+
+## Of Environmental Indicators
+ggplot(QData_I_CL %>%   select(BII_Weighted, BHI_Weighted, EPI, NDGAIN) %>%
+       pivot_longer(everything(), names_to = "Risk Measure", values_to = "Value")) +  geom_histogram(aes(x = Value), 
+                 binwidth = function(x) diff(range(x, na.rm = TRUE))/30,
+                 fill = "darkgreen",  color = "black", alpha = 0.7) +
+  facet_wrap(~`Risk Measure`, scales = "free") + theme_minimal() +
+  labs( title = "Distribution of Climate and Nature Vulnerability Measures",
+    x = "Value",
+    y = "Frequency")
+```
+
+```{r Outlier Removal}
+
+# We check for the outliers in the data by constructing simple linear regressions for each maturity. 
+# Subsequently, we plot the leverage and studentized residuals to identify the outliers. 
+# Only removing those with above threshold leverage (twice the mean leverage) and studentized residuals (twice the standard deviation of the studentized residuals).
+# And where country-quarter observations lie in idiosyncratic event, e.g. severe financial crisis, civil war, etc.
+
+# First, we filter out missing values for all relevant variables
+model_data_ten <- QData_I_CL_clean %>%
+  filter(!is.na(TenYrSpread), !is.na(BII_Weighted), !is.na(Inflation), !is.na(PB),!is.na(CA), !is.na(GDP), !is.na(DebtGDP), !is.na(FM_Depth), !is.na(WGI_RL), !is.na(CPI_Food))
+
+model_data_five <- QData_I_CL_clean %>%
+  filter(!is.na(FiveYrSpread), !is.na(BII_Weighted), !is.na(Inflation), !is.na(PB),!is.na(CA), !is.na(GDP), !is.na(DebtGDP), !is.na(FM_Depth), !is.na(WGI_RL), !is.na(CPI_Food))
+
+model_data_two <- QData_I_CL_clean %>%
+  filter(!is.na(TwoYrSpread), !is.na(BII_Weighted), !is.na(Inflation), !is.na(PB),!is.na(CA), !is.na(GDP), !is.na(DebtGDP), !is.na(FM_Depth), !is.na(WGI_RL), !is.na(CPI_Food))
+
+initial_modelTen <- lm(TenYrSpread ~ BII_Weighted + Inflation + PB + CA + GDP + DebtGDP + FM_Depth + WGI_RL + CPI_Food, 
+                   data = model_data_ten)
+initial_modelFive <- lm(FiveYrSpread ~ BII_Weighted  + Inflation + PB + CA + GDP + DebtGDP + FM_Depth + WGI_RL + CPI_Food, 
+                   data = model_data_five)
+initial_modelTwo <- lm(TwoYrSpread ~ BII_Weighted + Inflation + PB + CA + GDP + DebtGDP + FM_Depth + WGI_RL + CPI_Food, 
+                   data = model_data_two)
+
+# General diagnostics based on simple linear regression model. 
+check_model(initial_modelTen)
+check_model(initial_modelFive)
+check_model(initial_modelTwo)
+
+# Create diagnostic measures for Ten Year Spreads
+initial_diagnosticsTen <- data.frame(
+  CountryYrQtr = model_data_ten$CountryYrQtr, Leverage = hatvalues(initial_modelTen),
+  Studentized_Residuals = rstudent(initial_modelTen)
+) %>%
+  mutate(
+    high_leverage = Leverage > 2 * mean(Leverage),
+    high_residual = abs(Studentized_Residuals) > 2,  point_type = case_when(
+      high_leverage & high_residual ~ "Both",  high_leverage ~ "High Leverage",
+      high_residual ~ "High Residual", TRUE ~ "Normal"
+    )
+  )
+
+initial_diagnosticsFive <- data.frame(
+  CountryYrQtr = model_data_five$CountryYrQtr, Leverage = hatvalues(initial_modelFive),
+  Studentized_Residuals = rstudent(initial_modelFive)
+) %>%
+  mutate(
+    high_leverage = Leverage > 2 * mean(Leverage),
+    high_residual = abs(Studentized_Residuals) > 2,  point_type = case_when(
+      high_leverage & high_residual ~ "Both",  high_leverage ~ "High Leverage",
+      high_residual ~ "High Residual", TRUE ~ "Normal"
+    )
+  )
+
+initial_diagnosticsTwo <- data.frame(
+  CountryYrQtr = model_data_two$CountryYrQtr, Leverage = hatvalues(initial_modelTwo),
+  Studentized_Residuals = rstudent(initial_modelTwo)
+) %>%
+  mutate(
+    high_leverage = Leverage > 2 * mean(Leverage),
+    high_residual = abs(Studentized_Residuals) > 2,  point_type = case_when(
+      high_leverage & high_residual ~ "Both",  high_leverage ~ "High Leverage",
+      high_residual ~ "High Residual", TRUE ~ "Normal"
+    )
+  )
+
+# Create a combined plot for all three spreads
+ggplot(initial_diagnosticsTen, aes(x = Leverage, y = Studentized_Residuals)) +
+  geom_point(aes(color = point_type), alpha = 0.6) +
+  geom_text_repel(data = subset(initial_diagnosticsTen, point_type != "Normal"),aes(label = CountryYrQtr),size = 3) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 2 * mean(initial_diagnosticsTen$Leverage), linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("Both" = "red", "High Leverage" = "orange", "High Residual" = "blue", "Normal" = "grey")) +
+  labs( title = "Outlier and Leverage Diagnostics for Ten Year Spreads",
+    x = "Leverage", y = "Studentized Residuals",
+    color = "Diagnostic Type",caption = "Red lines indicate thresholds for outliers") +
+  theme_minimal() + scale_color_manual(values = wes_palette("Moonrise3"))
+
+ggplot(initial_diagnosticsFive, aes(x = Leverage, y = Studentized_Residuals)) +
+  geom_point(aes(color = point_type), alpha = 0.6) +
+  geom_text_repel(data = subset(initial_diagnosticsFive, point_type != "Normal"),aes(label = CountryYrQtr),size = 3) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 2 * mean(initial_diagnosticsFive$Leverage), linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("Both" = "red", "High Leverage" = "orange", "High Residual" = "blue", "Normal" = "grey")) +
+  labs( title = "Outlier and Leverage Diagnostics for Five Year Spreads", 
+    x = "Leverage", y = "Studentized Residuals",
+    color = "Diagnostic Type",caption = "Red lines indicate thresholds for outliers") +
+  theme_minimal() + scale_color_manual(values = wes_palette("Moonrise3"))
+
+ggplot(initial_diagnosticsTwo, aes(x = Leverage, y = Studentized_Residuals)) +
+  geom_point(aes(color = point_type), alpha = 0.6) +
+  geom_text_repel(data = subset(initial_diagnosticsTwo, point_type != "Normal"),aes(label = CountryYrQtr),size = 3) +
+  geom_hline(yintercept = c(-2, 2), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 2 * mean(initial_diagnosticsTwo$Leverage), linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("Both" = "red", "High Leverage" = "orange", "High Residual" = "blue", "Normal" = "grey")) +
+  labs( title = "Outlier and Leverage Diagnostics for Two Year Spreads",
+    x = "Leverage", y = "Studentized Residuals",
+    color = "Diagnostic Type",caption = "Red lines indicate thresholds for outliers") +
+  theme_minimal() + scale_color_manual(values = wes_palette("Moonrise3"))
+
+# Remove outliers
+QData_I_clean <- QData_I %>%
+  filter(!(CountryYrQtr %in% c("GRC2010Q4","GRC2011Q1", "GRC2011Q2", "GRC2011Q3", "GRC2011Q4", "GRC2012Q1", "GRC2012Q2","GRC2012Q3", "GRC2012Q4","GRC2013Q1","GRC2013Q2","GRC2013Q3","GRC2013Q4", "GRC2015Q1", "GRC2015Q2", "IRL2015Q1", "IRL2016Q4", "IRL2017Q2","IRL2019Q2", "IRL2019Q4", "IRL2020Q1", "CHN2020Q1", "TUR2000Q1","TUR2000Q2","TUR2000Q3","TUR2000Q4", "TUR2001Q1", "TUR2001Q2","TUR2001Q3","TUR2001Q4","TUR2002Q1","TUR2002Q2" ,"TUR2002Q3", "TUR2002Q4", "TUR2003Q1","TUR2003Q2","TUR2003Q3","TUR2003Q4","TUR2004Q1","TUR2004Q2","TUR2004Q3","TUR2004Q4","TUR2008Q2","TUR2009Q1","TUR2018Q2","TUR2018Q3","TUR2018Q4" , "IDN2005Q4","IND2009Q3", "BGR2005Q4","BGR2007Q4","UGA2019Q4", "UGA2020Q1", "LKA2015Q1", "LKA2016Q1","ZMB2015Q4", "ZMB2016Q1","ZMB2016Q2","ZMB2016Q3","ZMB2019Q2","ZMB2019Q3","ZMB2019Q4","ZMB2020Q1","ZMB2020Q2","ZMB2020Q3","ZMB2020Q4")))
+QData_I_clean <- QData_I_clean %>%
+filter(!(ISO3 %in% c("NAM","NGA","TUN")))
+  
+QData_I_CL_clean <- QData_I_CL %>%
+  filter(!(CountryYrQtr %in% c("GRC2010Q4","GRC2011Q1", "GRC2011Q2", "GRC2011Q3", "GRC2011Q4", "GRC2012Q1", "GRC2012Q2","GRC2012Q3", "GRC2012Q4","GRC2013Q1","GRC2013Q2","GRC2013Q3","GRC2013Q4", "GRC2015Q1", "GRC2015Q2", "IRL2015Q1", "IRL2016Q4", "IRL2017Q2","IRL2019Q2", "IRL2019Q4", "IRL2020Q1", "CHN2020Q1", "TUR2000Q1","TUR2000Q2","TUR2000Q3","TUR2000Q4", "TUR2001Q1", "TUR2001Q2","TUR2001Q3","TUR2001Q4","TUR2002Q1","TUR2002Q2" ,"TUR2002Q3", "TUR2002Q4", "TUR2003Q1","TUR2003Q2","TUR2003Q3","TUR2003Q4","TUR2004Q1","TUR2004Q2","TUR2004Q3","TUR2004Q4","TUR2008Q2","TUR2009Q1","TUR2018Q2","TUR2018Q3","TUR2018Q4" , "IDN2005Q4","IND2009Q3", "BGR2005Q4","BGR2007Q4","UGA2019Q4", "UGA2020Q1", "LKA2015Q1", "LKA2016Q1","ZMB2015Q4", "ZMB2016Q1","ZMB2016Q2","ZMB2016Q3","ZMB2019Q2","ZMB2019Q3","ZMB2019Q4","ZMB2020Q1","ZMB2020Q2","ZMB2020Q3","ZMB2020Q4")))
+QData_I_CL_clean <- QData_I_CL_clean %>%
+filter(!(ISO3 %in% c("NAM","NGA","TUN")))
+
+QData_I_linear_clean <- QData_I_linear %>%
+  filter(!(CountryYrQtr %in% c("GRC2010Q4","GRC2011Q1", "GRC2011Q2", "GRC2011Q3", "GRC2011Q4", "GRC2012Q1", "GRC2012Q2","GRC2012Q3", "GRC2012Q4","GRC2013Q1","GRC2013Q2","GRC2013Q3","GRC2013Q4", "GRC2015Q1", "GRC2015Q2", "IRL2015Q1", "IRL2016Q4", "IRL2017Q2","IRL2019Q2", "IRL2019Q4", "IRL2020Q1", "CHN2020Q1", "TUR2000Q1","TUR2000Q2","TUR2000Q3","TUR2000Q4", "TUR2001Q1", "TUR2001Q2","TUR2001Q3","TUR2001Q4","TUR2002Q1","TUR2002Q2" ,"TUR2002Q3", "TUR2002Q4", "TUR2003Q1","TUR2003Q2","TUR2003Q3","TUR2003Q4","TUR2004Q1","TUR2004Q2","TUR2004Q3","TUR2004Q4","TUR2008Q2","TUR2009Q1","TUR2018Q2","TUR2018Q3","TUR2018Q4" , "IDN2005Q4","IND2009Q3", "BGR2005Q4","BGR2007Q4","UGA2019Q4", "UGA2020Q1", "LKA2015Q1", "LKA2016Q1","ZMB2015Q4", "ZMB2016Q1","ZMB2016Q2","ZMB2016Q3","ZMB2019Q2","ZMB2019Q3","ZMB2019Q4","ZMB2020Q1","ZMB2020Q2","ZMB2020Q3","ZMB2020Q4")))
+QData_I_linear_clean <- QData_I_linear_clean %>%
+filter(!(ISO3 %in% c("NAM","NGA","TUN")))
+```
+
+## Descriptive Statistics & Visualisations
+
+```{r Maps}
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Fix mismatching country codes between world map package and ISO3 naming convention.
+world <- world %>%
+  mutate(iso_a3 = case_when(
+    name == "France" ~ "FRA",
+    name == "Norway" ~ "NOR",
+    TRUE ~ iso_a3
+  ))
+
+# Prepare data for mapping (2015-2020 averages)
+map_data <- QData_Final %>%
+  dplyr::filter(Year >= 2015 & Year <= 2020) %>%
+  dplyr::group_by(ISO3) %>%
+  dplyr::summarise(
+    BII_Weighted = mean(BII_Weighted, na.rm = TRUE),
+    EPI = mean(EPI, na.rm = TRUE),
+    Inv_BII = mean(Inv_BII, na.rm = TRUE),
+    BHI_Weighted = mean(BHI_Weighted, na.rm = TRUE),
+    NDGAIN = mean(NDGAIN, na.rm = TRUE),
+    TwoYrSpread = mean(TwoYrSpread, na.rm = TRUE),
+    FiveYrSpread = mean(FiveYrSpread, na.rm = TRUE),
+    TenYrSpread = mean(TenYrSpread, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Create base map theme
+map_theme <- theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+# Function to create maps
+create_map <- function(data, variable, title, color_option = "plasma", legend_name = NULL) {
+  ggplot(data) +
+    geom_sf(aes(fill = .data[[variable]])) +
+    scale_fill_viridis_c(
+      option = color_option,
+      na.value = "grey80",
+      name = legend_name %||% variable
+    ) +
+    map_theme +
+    labs(
+      title = paste("Global Distribution of", title),
+      subtitle = "Average values 2015-2020"
+    )
+}
+
+# Join with world map data
+world_data <- world %>%
+  left_join(map_data, by = c("iso_a3" = "ISO3"))
+
+# Create maps
+map_specs <- list(
+  list("BII_Weighted", "Weighted Biodiversity Degradation (BII)", "plasma", "Weighted\nBiodiversity\nIntactness Index"),
+  list("Inv_BII", "Biodiversity Intactness Index", "plasma", "Biodiversity\nIntactness Index"),
+  list("BHI_Weighted", "Weighted Biodiversity Degradation (BHI)", "plasma", "Weighted\nBiodiversity\nHabitat Index"),
+  list("EPI", "Environmental Performance Index - Biodiversity and Habitat", "plasma", "EPI\nBiodiversity and Habitat"),
+  list("NDGAIN", "Climate Vulnerability", "plasma", "ND-GAIN\nClimate\nVulnerability"),
+  list("TenYrSpread", "10-Year Sovereign Borrowing Costs, Vanilla Debt", "plasma", "10-Year\nYield Spread"),
+  list("FiveYrSpread", "5-Year Sovereign Borrowing Costs, Vanilla Debt", "plasma", "5-Year\nYield Spread"),
+  list("TwoYrSpread", "2-Year Sovereign Borrowing Costs, Vanilla Debt", "plasma", "2-Year\nYield Spread")
+)
+
+# Generate all maps
+maps <- lapply(map_specs, function(spec) {
+  create_map(world_data, spec[[1]], spec[[2]], spec[[3]], spec[[4]])
+})
+maps[[1]]  # For BII_Weighted map
+maps[[2]]  # For Inv_BII map
+maps[[3]]  # For BHI_Weighted map
+maps[[4]]  # For EPI map
+maps[[5]]  # For NDGAIN map
+maps[[6]]  # For TenYrSpread map
+maps[[7]]  # For FiveYrSpread map
+maps[[8]]  # For TwoYrSpread map
+```
+
+```{r Line Plots}
+## Line plots: 
+# 1. Prepare data for time series plots
+# First we select the key variables, then pivot to a long format, and calculate quarterly means.
+# Individual country-level data (for thin background lines)
+# Second, we remove the countries we drop anyway and use QData_I_CL_Desc_Clean as temporary data frame for visualisations.
+QData_I_CL_Desc_Clean <- QData_I_CL %>% 
+  filter(!(ISO3 %in% c("NAM","NGA","TUN"))) # Ensure is aligned with outlier removal step. 
+
+time_series_individual_q <- QData_I_CL_Desc_Clean %>%
+  filter(IMF_Classification %in% c("AE", "EMDE"), Year >= 2001) %>%
+  select(YearQtr, IMF_Classification, ISO3, BII_Weighted, BHI_Weighted, EPI, NDGAIN, TenYrSpread, FiveYrSpread, TwoYrSpread, FM_Depth) %>%
+  pivot_longer(
+    cols = -c(YearQtr, IMF_Classification, ISO3),
+    names_to = "Variable",
+    values_to = "Value"
+  )
+
+# Group mean data (for thick overlay lines)
+time_series_data_q <- time_series_individual_q %>%
+  group_by(YearQtr, IMF_Classification, Variable) %>%
+  summarise(Mean_Value = mean(Value, na.rm = TRUE), .groups = "drop")
+
+# 2. Define a consistent theme for the plots
+ts_theme <- theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(size = 14, hjust = 0.5, face = "bold")
+  )
+
+# 3. Plot Environmental Variables using facet_wrap
+environmental_vars_q <- c("BII_Weighted", "BHI_Weighted", "EPI", "NDGAIN")
+
+# Define descriptive labels for the facets
+env_plot_labels <- c(
+  `BII_Weighted` = "Weighted Biodiversity Intactness Index",
+  `BHI_Weighted` = "Weighted Biodiversity and Habitat Index",
+  `EPI` = "EPI: Biodiversity and Habitat Sub-Index",
+  `NDGAIN` = "ND-GAIN Climate Vulnerability"
+)
+mark_plot_labels <- c(
+  `TenYrSpread` = "10-Year Spread",
+  `FiveYrSpread` = "5-Year Spread",
+  `TwoYrSpread` = "2-Year Spread", 
+  `FM_Depth` = "Capital Market Depth"
+)
+
+# Prepare individual data for environmental variables
+env_individual <- time_series_individual_q %>%
+  filter(Variable %in% environmental_vars_q) %>%
+  mutate(Variable = factor(Variable, levels = names(env_plot_labels), labels = env_plot_labels))
+
+# Prepare mean data for environmental variables  
+env_mean <- time_series_data_q %>%
+  filter(Variable %in% environmental_vars_q) %>%
+  mutate(Variable = factor(Variable, levels = names(env_plot_labels), labels = env_plot_labels))
+
+# Filter env_mean for Q1 only (annual data points pre-interpolation)
+env_mean_q1 <- env_mean %>%
+  mutate(Quarter = as.numeric(format(YearQtr, "%q"))) %>%
+  filter(Quarter == 1)
+
+# Prepare endpoint labels for environmental variables - individual country labels
+env_labels <- env_individual %>%
+  filter(!is.na(Value)) %>%
+  group_by(ISO3, IMF_Classification, Variable) %>%
+  filter(YearQtr == max(YearQtr)) %>%
+  ungroup()
+
+# Get color palette
+palette_colors <- wes_palette("Moonrise3")
+
+environmental_plot_q <- ggplot() +
+  # Individual country lines (thin, transparent background)
+  geom_line(data = env_individual,
+            aes(x = YearQtr, y = Value, group = interaction(ISO3, IMF_Classification), 
+                color = IMF_Classification),
+            linewidth = 0.3, alpha = 0.4) +
+  # Mean lines (thick overlay)
+  geom_line(data = env_mean,
+            aes(x = YearQtr, y = Mean_Value, color = IMF_Classification, 
+                group = IMF_Classification),
+            linewidth = 1.5) +
+  # Dot markers on Q1 only to show original annual data points
+  geom_point(data = env_mean_q1,
+             aes(x = YearQtr, y = Mean_Value, color = IMF_Classification),
+             size = 2, alpha = 0.8) +
+  # Labels at end of individual country lines
+  geom_text_repel(data = env_labels,
+                  aes(x = as.numeric(YearQtr), y = Value, label = ISO3, 
+                      color = IMF_Classification),
+                  nudge_x = 0.5, direction = "y", hjust = 0, segment.size = 0.2,
+                  size = 2, max.overlaps = 5,
+                  box.padding = 0.2, point.padding = 0.1,
+                  force = 1, show.legend = FALSE) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 2) +
+  ts_theme + 
+  scale_color_manual(values = palette_colors) +
+  labs(
+    x = "Year-Quarter",
+    y = "Value",
+    color = "IMF Classification" 
+  ) +
+  scale_x_yearqtr(format = "%Y-Q%q", n = 8, expand = expansion(mult = c(0.02, 0.12))) +
+  coord_cartesian(clip = "off")
+
+print(environmental_plot_q)
+
+# 4. Plot Market Variables using facet_wrap
+market_vars_q <- c("TenYrSpread", "FiveYrSpread", "TwoYrSpread", "FM_Depth")
+
+# Prepare individual data for market variables
+market_individual <- time_series_individual_q %>%
+  filter(Variable %in% market_vars_q) %>%
+  mutate(Variable = factor(Variable, levels = names(mark_plot_labels), labels = mark_plot_labels))
+
+# Prepare mean data for market variables
+market_mean <- time_series_data_q %>%
+  filter(Variable %in% market_vars_q) %>%
+  mutate(Variable = factor(Variable, levels = names(mark_plot_labels), labels = mark_plot_labels))
+
+# Split market mean data: quarterly series (spreads) vs annual series (FM_Depth)
+market_mean_quarterly <- market_mean %>%
+  filter(Variable != "Capital Market Depth")
+
+market_mean_annual <- market_mean %>%
+  filter(Variable == "Capital Market Depth") %>%
+  mutate(Quarter = as.numeric(format(YearQtr, "%q"))) %>%
+  filter(Quarter == 1)
+
+# Prepare endpoint labels for market variables - individual country labels
+market_labels <- market_individual %>%
+  filter(!is.na(Value)) %>%
+  group_by(ISO3, IMF_Classification, Variable) %>%
+  filter(YearQtr == max(YearQtr)) %>%
+  ungroup()
+
+market_plot_q <- ggplot() +
+  # Individual country lines (thin, transparent background)
+  geom_line(data = market_individual,
+            aes(x = YearQtr, y = Value, group = interaction(ISO3, IMF_Classification), 
+                color = IMF_Classification),
+            linewidth = 0.3, alpha = 0.2) +
+  # Mean lines (thick overlay)
+  geom_line(data = market_mean,
+            aes(x = YearQtr, y = Mean_Value, color = IMF_Classification, 
+                group = IMF_Classification),
+            linewidth = 1.2) +
+  # Dot markers for quarterly series (spreads)
+  geom_point(data = market_mean_quarterly,
+             aes(x = YearQtr, y = Mean_Value, color = IMF_Classification),
+             size = 1.5, alpha = 0.7) +
+  # Dot markers for annual series (FM_Depth) - Q1 only
+  geom_point(data = market_mean_annual,
+             aes(x = YearQtr, y = Mean_Value, color = IMF_Classification),
+             size = 2, alpha = 0.8) +
+  # Labels at end of individual country lines
+  geom_text_repel(data = market_labels,
+                  aes(x = as.numeric(YearQtr), y = Value, label = ISO3, 
+                      color = IMF_Classification),
+                  nudge_x = 0.5, direction = "y", hjust = 0, segment.size = 0.2,
+                  size = 2, max.overlaps = 4,
+                  box.padding = 0.2, point.padding = 0.1,
+                  force = 1, show.legend = FALSE) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 2) +
+  ts_theme + 
+  scale_color_manual(values = palette_colors) +
+  labs(
+    x = "Year-Quarter",
+    y = "Value",
+    color = "IMF Classification"
+  ) +
+  scale_x_yearqtr(format = "%Y-Q%q", n = 8, expand = expansion(mult = c(0.02, 0.12))) +
+  coord_cartesian(clip = "off")
+
+print(market_plot_q)
+```
+
+```{r Descriptive Statistics}
+#2.: This section creates the descriptive tables and summary statistics
+# Correlation tests 
+correlation_data <- as.matrix(QData_Final[c("BII_Weighted", "BHI_Weighted","EPI", "NDGAIN","TwoYrSpread","FiveYrSpread","TenYrSpread","Inflation", "CA", "PB","GDP", "DebtGDP", "CPI_Food", "FM_Depth","WGI_RL")])
+# Create a copy of correlation data with renamed columns for labeling
+correlation_data_labeled <- correlation_data
+colnames(correlation_data_labeled) <- c("Weighted BII", "Weighted BHI", "EPI", "Climate Vulnerability", "2-Year Spread", "5-Year Spread", "10-Year Spread", "Inflation", "Current Account", "Primary Balance","GDP-Growth", "Debt-to-GDP Ratio", "CPI Food", "Cap. Mark. Depth","Rule of Law")
+# Calculate correlation with labeled data
+correlation_results_labeled <- rcorr(correlation_data_labeled, type = "spearman")
+# Create a visualization of the correlations with proper labels
+ggcorrplot(
+  correlation_results_labeled$r, p.mat = correlation_results_labeled$P, 
+  type = "lower", lab = TRUE, insig = "blank", sig.level = 0.05,
+  title = "Spearman Correlation Coefficients")
+
+
+# Generate summary statistics by IMF Classification
+variables <- c("TenYrSpread", "FiveYrSpread", "TwoYrSpread", "NDGAIN", 
+              "BII_Weighted", "BHI_Weighted", "EPI", "Inflation",
+              "GDP", "CA", "PB", "DebtGDP", "CPI_Food", "FM_Depth","WGI_RL")
+
+# First, calculate the average within-country standard deviation for each group
+within_sds <- QData_Final %>%
+  filter(IMF_Classification %in% c("AE", "EMDE")) %>%
+  group_by(IMF_Classification, ISO3) %>%
+  summarise(across(all_of(variables), ~sd(.x, na.rm = TRUE), .names = "{.col}_sd"), .groups = "drop") %>%
+  group_by(IMF_Classification) %>%
+  summarise(across(ends_with("_sd"), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# Calculate N (number of countries) and Avg_T (average time periods per country) for each variable
+panel_dims <- QData_Final %>%
+  filter(IMF_Classification %in% c("AE", "EMDE")) %>%
+  group_by(IMF_Classification) %>%
+  summarise(across(all_of(variables),
+                   list(
+                     # N = number of unique countries with non-NA values
+                     N = ~n_distinct(ISO3[!is.na(.)]),
+                     # Avg_T = average number of observations per country
+                     Avg_T = ~{
+                       obs_per_country <- tapply(!is.na(.), ISO3, sum)
+                       mean(obs_per_country[obs_per_country > 0], na.rm = TRUE)
+                     }
+                   ),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop")
+
+# Calculate the other statistics (n, mean, min, max) for each group
+other_stats <- QData_Final %>%
+  filter(IMF_Classification %in% c("AE", "EMDE")) %>%
+  group_by(IMF_Classification) %>%
+  summarise(across(all_of(variables),
+                   list(n = ~sum(!is.na(.)), 
+                        mean = ~mean(., na.rm = TRUE),
+                        min = ~min(., na.rm = TRUE),
+                        max = ~max(., na.rm = TRUE)),
+                   .names = "{.col}_{.fn}"),
+            .groups = "drop")
+
+# Join all summary tables together
+descriptive_stats <- other_stats %>%
+  left_join(within_sds, by = "IMF_Classification") %>%
+  left_join(panel_dims, by = "IMF_Classification")
+
+# Reshape the data for presentation
+descriptive_stats_long <- descriptive_stats %>%
+  pivot_longer(
+    cols = -IMF_Classification,
+    names_to = c("Variable", ".value"),
+    names_pattern = "([A-Za-z0-9_]+)_(n|mean|sd|min|max|N|Avg_T)"
+  ) %>%
+  mutate(Variable = case_when(
+    Variable == "TenYrSpread"  ~ "Ten Year Spread",
+    Variable == "FiveYrSpread"  ~ "Five Year Spread",
+    Variable == "TwoYrSpread"  ~ "Two Year Spread",
+    Variable == "NDGAIN" ~ "Climate Vulnerability",
+    Variable == "BII_Weighted" ~ "Weighted BII",
+    Variable == "BHI_Weighted" ~ "Weighted BHI",
+    Variable == "EPI" ~ "EPI",
+    Variable == "Inflation" ~ "Inflation",
+    Variable == "CA" ~ "Current Account",
+    Variable == "PB" ~ "Primary Balance",
+    Variable == "GDP" ~ "GDP Growth",
+    Variable == "DebtGDP" ~ "Debt-to-GDP",
+    Variable == "CPI_Food" ~ "CPI Food",
+    Variable == "FM_Depth"  ~ "Capital Market Depth",
+    Variable == "WGI_RL"  ~ "Rule of Law",
+    TRUE ~ Variable  # Keep other variables unchanged
+  )) %>%
+  # Reorder columns: Variable, n, N, Avg_T, mean, sd, min, max
+  select(IMF_Classification, Variable, n, N, Avg_T, mean, sd, min, max)
+
+# Create separate tables for AE and EMDE
+ae_stats <- descriptive_stats_long %>%
+  filter(IMF_Classification == "AE") %>%
+  select(-IMF_Classification) %>%
+  kable(
+    format = "latex",
+    col.names = c("Variable", "Obs", "N", "Avg T", "Mean", "Std Dev", "Min", "Max"),
+    caption = "Descriptive Statistics for Advanced Economies (AEs)",
+    digits = 2
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE
+  )
+
+emde_stats <- descriptive_stats_long %>%
+  filter(IMF_Classification == "EMDE") %>%
+  select(-IMF_Classification) %>%
+  kable(
+    format = "latex",
+    col.names = c("Variable", "Obs", "N", "Avg T", "Mean", "Std Dev", "Min", "Max"),
+    caption = "Descriptive Statistics for Emerging Market and Developing Economies (EMDEs)",
+    digits = 2
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE
+  )
+
+# Print both tables
+print(ae_stats)
+print(emde_stats)
+
+# 2.1 Country overview table with avg of key values
+country_overview_data <- QData_Final %>%
+  group_by(ISO3, `Country Name`) %>%
+  summarise(
+    IMF_Classification = first(IMF_Classification),
+    Avg_BII_Weighted = mean(BII_Weighted, na.rm = TRUE),
+    Avg_BHI_Weighted = mean(BHI_Weighted, na.rm = TRUE),
+    Avg_EPI = mean(EPI, na.rm = TRUE),
+    Avg_NDGAIN = mean(NDGAIN, na.rm = TRUE),
+    Avg_TenYrSpread = mean(TenYrSpread, na.rm = TRUE),
+    Avg_FiveYrSpread = mean(FiveYrSpread, na.rm = TRUE),
+    Avg_TwoYrSpread = mean(TwoYrSpread, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  # Arrange alphabetically by country name for easy reference
+  arrange(IMF_Classification, `Country Name`)
+
+# 2. Print the table using kable for nice formatting
+print(
+  knitr::kable(country_overview_data,
+    caption = "Country Overview: Average Values of Key Variables",
+    col.names = c("ISO", "Country", "IMF Group", "Weighted BII", "Weighted BHI", "EPI", "Climate Vulnerability", "10-Year Spread", "5-Year Spread", "2-Year Spread"),
+    digits = 2,
+    format = "latex"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE)
+)
+
+```
+
+```{r Scatter Plots}
+# 5 Year and Climate
+ggplot(QData_Final %>% filter(YearQtr <= "2020Q4"), aes(x = FiveYrSpread, y = NDGAIN, size = FM_Depth, color = IMF_Classification)) +
+  geom_point(alpha = 0.5) + geom_smooth(method = "lm", se = TRUE, color = "grey", show.legend = FALSE) +
+  geom_label_repel(aes(label = CountryYrQtr), size = 3, color = "black") +  # Repels overlapping labels 
+  scale_size_continuous(range = c(1, 10)) + theme_minimal() + scale_color_manual(values = wes_palette("Moonrise3")) +
+  labs( title = "Sovereign Bond Yield Spread vs Climate Vulnerability",
+    x = "5yr Spread", y = "ND-GAIN Climate Vulnerability Index",
+    size = "Capital Market Depth", colour = "IMF Group")
+
+# 5 Year and Nature
+ggplot(QData_Final %>% filter(YearQtr <= "2020Q4"), aes(x = FiveYrSpread, y = BII_Weighted, size = FM_Depth, color = IMF_Classification)) +
+  geom_point(alpha = 0.5) + geom_smooth(method = "lm", se = TRUE, color = "grey", show.legend = FALSE) +
+  geom_label_repel(aes(label = CountryYrQtr), size = 3, color = "black") +  # Repels overlapping labels 
+  scale_size_continuous(range = c(1, 10)) + theme_minimal() + scale_color_manual(values = wes_palette("Moonrise3")) +
+  labs( title = "Sovereign Bond Yield Spread vs Nature Vulnerability: Weighted Biodiversity Intactness",
+    x = "5yr Spread", y = "Weighted, Inverse Biodiversity Intactness Index",
+    size = "Capital Market Depth", color = "IMF Group")
+
+ggplot(QData_Final %>% filter(YearQtr <= "2020Q4"), aes(x = FiveYrSpread, y = EPI, size = FM_Depth, color = IMF_Classification)) +
+  geom_point(alpha = 0.5) + geom_smooth(method = "lm", se = TRUE, color = "grey", show.legend = FALSE) +
+  geom_label_repel(aes(label = CountryYrQtr), size = 3, color = "black") +  # Repels overlapping labels 
+  scale_size_continuous(range = c(1, 10)) + theme_minimal() + scale_color_manual(values = wes_palette("Moonrise3")) +
+  labs( title = "Sovereign Bond Yield Spread vs Nature Vulnerability: Environmental Performance Index",
+    x = "5yr Spread", y = "EPI: Biodiversity and Habitat Sub-index",
+    size = "Capital Market Depth", color = "IMF Group")
+
+ggplot(QData_Final %>% filter(YearQtr <= "2020Q4"), aes(x = FiveYrSpread, y = BHI_Weighted, size = FM_Depth, color = IMF_Classification)) +
+  geom_point(alpha = 0.5) + geom_smooth(method = "lm", se = TRUE, color = "grey", show.legend = FALSE) +
+  geom_label_repel(aes(label = CountryYrQtr), size = 3, color = "black") +  # Repels overlapping labels 
+  scale_size_continuous(range = c(1, 10)) + theme_minimal() + scale_color_manual(values = wes_palette("Moonrise3")) +
+  labs( title = "Sovereign Bond Yield Spread vs Nature Vulnerability: Weighted Biodiversity Habitat Index",
+    x = "5yr Spread", y = "Weighted, Inverse Biodiversity Habitat Index",
+    size = "Capital Market Depth", color = "IMF Group")
+```
+
+## IFE Models
+
+```{r Interactive Fixed Effects}
+# 1. Prepare Base Data
+# Create a specific dataframe for IFE from QData_Final
+QData_IFE <- as.data.frame(QData_Final)
+# Convert YearQtr to numeric factor as required by interFE (Note, that this is not required for QIFE, it's a package issue)
+QData_IFE$YearQtr <- as.numeric(as.factor(QData_IFE$YearQtr)) 
+QData_IFE$ISO3 <- as.character(QData_IFE$ISO3)
+
+# 2. Manual test for one specification to check for any previous errors. 
+ cols_needed <- c("TwoYrSpread", "BII_Weighted_L1", "Inflation", "PB", "CA", "GDP", "DebtGDP", "FM_Depth", "WGI_RL", "ISO3", "YearQtr", "CPI_Food")
+QData_IFE_Test <- QData_IFE[cols_needed]
+# 3. Drop rows with ANY missing values in these columns
+QData_IFE_Test <- na.omit(QData_IFE_Test)
+TwoBII_IFE <- interFE(TwoYrSpread ~ BII_Weighted_L1 + Inflation + PB + CA + GDP + DebtGDP + FM_Depth + WGI_RL + CPI_Food, data = QData_IFE_Test, index = c("ISO3", "YearQtr"),  r =2,  force = "unit", nboots = 150, seed = 1)
+
+## Loop across all IFE specifications
+# interFE() uses argument r; object names use k to avoid confusion with R-squared.
+dependent_vars   <- c("TwoYrSpread", "FiveYrSpread", "TenYrSpread")
+independent_vars <- c("BII_Weighted_L1", "BHI_Weighted_L1", "NDGAIN_L1", "EPI_L1")
+controls         <- c("Inflation", "PB", "CA", "GDP", "DebtGDP",
+                      "FM_Depth", "WGI_RL", "CPI_Food")
+
+run_ife_grid <- function(k_factors) {
+  results <- list()
+  for (dv in dependent_vars) {
+    for (iv in independent_vars) {
+      model_name <- paste(dv, iv, sep = "_")
+      message(paste("Running IFE k=", k_factors, ":", model_name))
+
+      formula_str <- paste(dv, "~", iv, "+", paste(controls, collapse = " + "))
+
+      ldv_cols <- c(dv)
+      if (grepl(paste0(dv, "_L1"), formula_str, fixed = TRUE)) {
+        ldv_cols <- c(ldv_cols, paste0(dv, "_L1"))
+      }
+      if (grepl(paste0(dv, "_L2"), formula_str, fixed = TRUE)) {
+        ldv_cols <- c(ldv_cols, paste0(dv, "_L2"))
+      }
+
+      cols_needed <- c(ldv_cols, iv, controls, "ISO3", "YearQtr")
+
+      missing_cols <- setdiff(cols_needed, names(QData_IFE))
+      if (length(missing_cols) > 0) {
+        warning(paste("Missing columns for", model_name, ":",
+                      paste(missing_cols, collapse = ", "), "- skipping"))
+        next
+      }
+
+      data_subset <- na.omit(QData_IFE[, cols_needed])
+      if (nrow(data_subset) < 50) {
+        warning(paste("Insufficient data for", model_name, "- skipping"))
+        next
+      }
+
+      fit <- tryCatch({
+        interFE(
+          formula = as.formula(formula_str),
+          data    = data_subset,
+          index   = c("ISO3", "YearQtr"),
+          r       = k_factors,
+          force   = "unit",
+          nboots  = 1000,
+          se      = TRUE,
+          seed    = 1,
+          normalize = FALSE
+        )
+      }, error = function(e) {
+        message(paste("Error in", model_name, ":", e$message)); NULL
+      })
+
+      if (!is.null(fit)) {
+        results[[model_name]] <- fit
+        # print(paste("--- Results for", model_name, "(k=", k_factors, ") ---"))
+        # print(fit$est.table)
+      }
+    }
+  }
+  results
+}
+
+ife_results_k0_list <- run_ife_grid(0)
+ife_results_k1_list <- run_ife_grid(1)
+ife_results_k2_list <- run_ife_grid(2)
+
+saveRDS(ife_results_k0_list, file = "ife_results_k0.rds")
+saveRDS(ife_results_k1_list, file = "ife_results_k1.rds")
+saveRDS(ife_results_k2_list, file = "ife_results_k2.rds")
+
+# Reload helper (use after a full run, or skip the loops above)
+ife_results_k0_list <- readRDS("ife_results_k0.rds")
+ife_results_k1_list <- readRDS("ife_results_k1.rds")
+ife_results_k2_list <- readRDS("ife_results_k2.rds")
+
+
+# 5) Extract ALL Coefficients from IFE Results 
+extract_all_ife_coefficients <- function(ife_list) {
+  all_coefs <- list()
+  
+  for (model_name in names(ife_list)) {
+    fit <- ife_list[[model_name]]
+    
+    if (is.null(fit) || is.null(fit$est.table)) {
+      message(paste("Skipping", model_name, "- no coefficients found."))
+      next
+    }
+    
+    coefs <- fit$est.table
+    
+    # Identify DV from model name (reuse variables already defined in loop)
+    dv_name <- NA
+    if (grepl("TwoYrSpread", model_name)) dv_name <- "TwoYrSpread"
+    if (grepl("FiveYrSpread", model_name)) dv_name <- "FiveYrSpread"
+    if (grepl("TenYrSpread", model_name)) dv_name <- "TenYrSpread"
+    
+    # Identify IV from model name (reuse variables already defined in loop)
+    # Note: Handle both "Vulnerability" (old saved results) and "NDGAIN" (current name)
+    iv_name <- NA
+    if (grepl("BII_Weighted", model_name)) iv_name <- "BII_Weighted_L1"
+    if (grepl("BHI_Weighted", model_name)) iv_name <- "BHI_Weighted_L1"
+    if (grepl("NDGAIN", model_name) || grepl("Vulnerability", model_name)) iv_name <- "NDGAIN_L1"
+    if (grepl("EPI", model_name)) iv_name <- "EPI_L1"
+    
+    # Extract ALL coefficients (including controls, not just main IVs)
+    for (var_name in rownames(coefs)) {
+      est <- coefs[var_name, "Coef"]
+      se <- coefs[var_name, "S.E."]
+      pval <- coefs[var_name, "p.value"]
+      ci_lower <- coefs[var_name, "CI.lower"]
+      ci_upper <- coefs[var_name, "CI.upper"]
+      
+      # Significance stars
+      sig <- case_when(
+        pval < 0.01 ~ "***",
+        pval < 0.05 ~ "**",
+        pval < 0.1 ~ "*",
+        TRUE ~ ""
+      )
+      
+      all_coefs[[length(all_coefs) + 1]] <- data.frame(
+        Model = model_name,
+        Dependent_Variable = dv_name,
+        Independent_Variable = iv_name,
+        Variable = var_name,
+        Estimate = est,
+        Std_Error = se,
+        P_Value = pval,
+        CI_Lower = ci_lower,
+        CI_Upper = ci_upper,
+        Significance = sig,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  
+  return(do.call(rbind, all_coefs))
+}
+# Extract all coefficients into a single dataframe
+ife_results_k2 <- extract_all_ife_coefficients(ife_results_k2_list)
+ife_results_k1 <- extract_all_ife_coefficients(ife_results_k1_list)
+ife_results_k0 <- extract_all_ife_coefficients(ife_results_k0_list)
+
+# Adjusted R^2 is not natively computed from the interFE package, we proceed manually:
+# Function to calculate within R² for all IFE models
+calculate_ife_within_r2 <- function(ife_list) {
+  r2_results <- data.frame()
+  for (model_name in names(ife_list)) {
+    fit <- ife_list[[model_name]]
+    
+    if (is.null(fit) || is.null(fit$est.table)) {
+      message(paste("Skipping", model_name, "- no coefficients found."))
+      next
+    }
+    Y_mat    <- fit$dat.Y
+    res_mat  <- fit$residuals
+    # 1. Mask real observations (exclude padded zero-zero cells)
+    obs <- !is.na(Y_mat) & !is.na(res_mat)
+    obs <- obs & (Y_mat != 0 | res_mat != 0)
+    # 2. Country-demean Y within observed cells
+    Y_within <- Y_mat
+    for (j in seq_len(ncol(Y_mat))) {
+      idx_j <- obs[, j]
+      if (any(idx_j)) {
+        mu_j <- mean(Y_mat[idx_j, j], na.rm = TRUE)   # mean for country j over observed t
+        Y_within[idx_j, j] <- Y_mat[idx_j, j] - mu_j  # demean within country
+        Y_within[!idx_j, j] <- NA                     # keep non-obs out
+      } else {
+        Y_within[, j] <- NA
+      }
+    }
+    # 3. Calculate panel dimensions
+    # Count valid observations per country (columns)
+    T_per_country <- colSums(obs, na.rm = TRUE)  # Number of time periods per country
+    n_countries <- sum(T_per_country > 0)         # Number of countries with at least one observation
+    avg_T <- mean(T_per_country[T_per_country > 0], na.rm = TRUE)  # Average T across countries
+    
+    # 4. Vectorise over observed cells
+    y_within_vec <- as.numeric(Y_within[obs])
+    res_vec      <- as.numeric(res_mat[obs])
+    
+    # 5. Within TSS and RSS
+    TSS_within <- sum((y_within_vec - mean(y_within_vec, na.rm = TRUE))^2, na.rm = TRUE)
+    RSS        <- sum(res_vec^2, na.rm = TRUE)
+    
+    if (TSS_within > 0) {
+      R2_within <- 1 - RSS / TSS_within
+      
+      n_obs <- length(y_within_vec)
+      n_covars <- nrow(fit$est.table) - 1  # excluding intercept
+      if (n_obs > n_covars + 1) {
+        Adj_R2_within <- 1 - (1 - R2_within) * ((n_obs - 1) / (n_obs - n_covars - 1))
+      } else {Adj_R2_within <- NA}
+      r2_results <- rbind(r2_results, data.frame(
+        Model = model_name,
+        R_Squared_Within = R2_within,
+        Adj_R_Squared_Within = Adj_R2_within,
+        N_Obs = n_obs,
+        N_Countries = n_countries,
+        Avg_T = avg_T,
+        stringsAsFactors = FALSE))}}
+  return(r2_results)
+}
+
+# Calculate within R² for all models (cycle through factor specification, e.g. k1, k2, k0)
+ife_within_r2_k2 <- calculate_ife_within_r2(ife_results_k2_list) # and for k1 and k0
+print(ife_within_r2_k2)
+
+# Merge R² and panel dimensions into ife_results_k1 (k0, or k2) dataframe
+ife_results_k2 <- ife_results_k2 %>%
+  left_join(ife_within_r2_k2 %>% select(Model, R_Squared_Within, Adj_R_Squared_Within, N_Obs, N_Countries, Avg_T), by = "Model")
+print(ife_results_k2, max = 4000) # and cycle through factor specification, e.g. k1, k2, k0. Visualised in latex format in the paper. 
+
+```
+
+```{r IFE Visualisation}
+# IFE Point Estimate Bar Chart
+ife_results_k1_list <- readRDS("ife_results_k1.rds")
+five_models <- grep("^TwoYrSpread_", names(ife_results_k1_list), value = TRUE)
+
+all_coefs <- lapply(five_models, function(nm) {
+  tbl <- as.data.frame(ife_results_k1_list[[nm]]$est.table)
+  tbl$variable <- rownames(tbl)
+  tbl[tbl$variable != "_const", ]
+})
+coefs_df <- bind_rows(all_coefs)
+
+nature_ivs <- c("BII_Weighted_L1", "BHI_Weighted_L1", "EPI_L1", "NDGAIN_L1")
+controls <- setdiff(unique(coefs_df$variable), c(nature_ivs))
+
+nature_df <- coefs_df %>%
+  filter(variable %in% nature_ivs) %>%
+  select(variable, Coef, CI.lower, CI.upper, p.value)
+
+control_df <- coefs_df %>%
+  filter(variable %in% controls) %>%
+  group_by(variable) %>%
+  summarise(Coef = mean(Coef), CI.lower = mean(CI.lower),
+            CI.upper = mean(CI.upper), p.value = mean(p.value), .groups = "drop")
+
+ife_plot_df <- bind_rows(nature_df, control_df)
+
+label_map <- c(
+  BII_Weighted_L1 = "Biodiversity Degradation (BII)",
+  BHI_Weighted_L1 = "Biodiversity Degradation (BHI)",
+  EPI_L1 = "Environmental Protection (EPI)",
+  NDGAIN_L1 = "Climate Vulnerability (ND-GAIN)",
+  Inflation = "Inflation",
+  PB = "Primary Balance",
+  CA = "Current Account",
+  FM_Depth = "Capital Market Depth",
+  GDP = "GDP Growth",
+  DebtGDP = "Debt-to-GDP",
+  WGI_RL = "Rule of Law (WGI)",
+  CPI_Food = "Food Price Inflation"
+)
+ife_plot_df$label <- label_map[ife_plot_df$variable]
+ife_plot_df$sig <- ifelse(ife_plot_df$p.value < 0.01, "***",
+              ifelse(ife_plot_df$p.value < 0.05, "**",
+              ifelse(ife_plot_df$p.value < 0.1, "*", "")))
+ife_plot_df$group <- ifelse(ife_plot_df$variable %in% nature_ivs, "Nature / Climate Vulnerability", "Domestic Macroeconomic Controls")
+ife_plot_df <- ife_plot_df %>%
+  arrange(group, Coef) %>%
+  mutate(label = factor(label, levels = label))
+
+all_x <- c(ife_plot_df$Coef, ife_plot_df$CI.lower, ife_plot_df$CI.upper)
+x_min <- c(-4)
+x_max <- c(2)
+x_breaks <- seq(x_min, x_max, by = 0.2)
+
+ggplot(ife_plot_df, aes(x = label, y = Coef, fill = group)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_errorbar(aes(ymin = CI.lower, ymax = CI.upper), width = 0.25, linewidth = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.3) +
+  geom_text(aes(label = sig,
+                y = ifelse(Coef >= 0, CI.upper + 0.05, CI.lower - 0.05)),
+            size = 3.5, vjust = ifelse(ife_plot_df$Coef >= 0, 0, 1)) +
+  coord_flip() +
+  scale_y_continuous(breaks = x_breaks) +
+  scale_fill_manual(values = c("Nature / Climate Vulnerability" = "#2a9d8f", "Domestic Macroeconomic Controls" = "#264653")) +
+  labs(
+    title = "Interactive Fixed Effects: Impact on 5-Year Sovereign Spreads",
+    subtitle = "95% bootstrapped CIs, 1000 replications, k = 1. All variables have been standardized to one unit variance. Controls averaged across specifications.",
+    x = NULL, y = "Marginal Effect on 5-Year Yield Spread (pp)",
+    fill = NULL,
+    caption = "Significance: *** p<0.01, ** p<0.05, * p<0.1"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    #text=element_text(family="Mono"),
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey85", linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    plot.caption = element_text(size = 8, color = "grey50"),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+## QIFE 
+
+```{r PCA for Factors}
+### PCA
+# Create a T x N matrix of spreads
+# Match filtering used for QData_Final. Exclude countries missing 2-year spreads to balance panel.
+QData_PCA <- QData %>% 
+  filter(!(ISO3 %in% c("NAM","TUN","NGA","USA","EGY","HUN","MAR","LTU")) & (Year >= 2000 & Year <= 2020)) 
+QData_PCA <- QData_PCA %>% filter(!(CountryYrQtr %in%  c("GRC2010Q4","GRC2011Q1", "GRC2011Q2", "GRC2011Q3", "GRC2011Q4", "GRC2012Q1", "GRC2012Q2","GRC2012Q3", "GRC2012Q4","GRC2013Q1","GRC2013Q2","GRC2013Q3","GRC2013Q4", "GRC2015Q1", "GRC2015Q2", "IRL2015Q1", "IRL2016Q4", "IRL2017Q2","IRL2019Q2", "IRL2019Q4", "IRL2020Q1", "CHN2020Q1", "TUR2000Q1","TUR2000Q2","TUR2000Q3","TUR2000Q4", "TUR2001Q1", "TUR2001Q2","TUR2001Q3","TUR2001Q4","TUR2002Q1","TUR2002Q2" ,"TUR2002Q3", "TUR2002Q4", "TUR2003Q1","TUR2003Q2","TUR2003Q3","TUR2003Q4","TUR2004Q1","TUR2004Q2","TUR2004Q3","TUR2004Q4","TUR2008Q2","TUR2009Q1","TUR2018Q2","TUR2018Q3","TUR2018Q4" , "IDN2005Q4","IND2009Q3", "BGR2005Q4","BGR2007Q4","UGA2019Q4", "UGA2020Q1", "LKA2015Q1", "LKA2016Q1","ZMB2015Q4", "ZMB2016Q1","ZMB2016Q2","ZMB2016Q3","ZMB2019Q2","ZMB2019Q3","ZMB2019Q4","ZMB2020Q1")))
+
+spread_matrix <- QData_PCA %>%
+  select(ISO3, YearQtr, TwoYrSpread, FiveYrSpread, TenYrSpread) %>%
+  pivot_wider(names_from = ISO3, values_from = c(TwoYrSpread, FiveYrSpread, TenYrSpread)) %>%
+  arrange(YearQtr)
+
+# Remove YearQtr column to construct numeric matrix
+spread_matrix <- as.matrix(spread_matrix[,-1]) 
+
+# Center data
+spread_matrix_centered <- scale(spread_matrix, center = TRUE, scale = FALSE)
+nb <- estim_ncpPCA(spread_matrix_centered, ncp.max = 5)
+res.comp <- imputePCA(spread_matrix_centered, ncp = nb$ncp)
+pca_final <- prcomp(res.comp$completeObs, center = TRUE, scale. = FALSE)
+K1 <- pca_final$x[, 1]
+K2 <- pca_final$x[,2]
+summary(pca_final)$importance
+
+# Alternative (Force 2 components)
+res.comp_alt <- imputePCA(spread_matrix_centered, ncp = 2)
+pca_alt <- prcomp(res.comp_alt$completeObs, center = TRUE, scale = FALSE)
+K1_alt <- pca_alt$x[,1]
+K2_alt <- pca_alt$x[,2]
+
+# High correlation suggests robustness for the number of components selected
+cor(K1, K1_alt) 
+cor(K2, K2_alt)
+summary(pca_alt)$importance
+
+# Robustness check: interpolated spreads data
+spread_matrix_Int <- QData_PCA %>%
+  select(ISO3, YearQtr, ITwoYrSpread, IFiveYrSpread, ITenYrSpread) %>%
+  pivot_wider(names_from = ISO3, values_from = c(ITwoYrSpread, IFiveYrSpread, ITenYrSpread)) %>%
+  arrange(YearQtr)
+spread_matrix_centered_Int <- scale(spread_matrix_Int, center = TRUE, scale = FALSE)
+spread_matrix_Int <- as.matrix(spread_matrix_Int[,-1]) # removing YearQtr column
+nb_Int <- estim_ncpPCA(spread_matrix_centered_Int, ncp.max = 5)
+res.comp_Int <- imputePCA(spread_matrix_centered_Int, ncp = nb$ncp)
+pca_final_Int <- prcomp(res.comp_Int$completeObs, center = TRUE, scale. = FALSE)
+K1_Int <- pca_final_Int$x[, 1]
+K1_Int
+K2_Int <- pca_final_Int$x[,2]
+summary(pca_final_Int)$importance
+
+# The first two principal components account for ≈ 66-78% of the cumulative proportion of the variance in centered spreads
+# In line with e.g. Wang 2021 and Gomez-Gonzalez 2025, we proceed with K=2 factors. 
+
+# Add factor(s) to QData_Final
+QData_Trimmed <- QData_Final %>%
+  filter(Year >= 2000 & Year <= 2020)
+
+stopifnot(
+  "PCA row count does not match unique quarters in QData_Trimmed" =
+    length(unique(QData_Trimmed$YearQtr)) == nrow(pca_alt$x)
+)
+
+PCA_factor_df <- data.frame(
+  YearQtr = sort(unique(QData_Trimmed$YearQtr)),
+  K1 = pca_alt$x[, 1],
+  K2 = pca_alt$x[, 2]
+)
+QData_Final <- QData_Final %>%
+  left_join(PCA_factor_df, by = "YearQtr")
+
+## Validate PCA Factor K1 Against Common Macro Dynamics 
+# Inclusion of K1 and K2 to capture the country-specific sesntivity to global shocks is valid insofar as the factors are correlated with the global macro dynamics we asssume they represent (i.e. bond market conditions). 
+# Create time series comparison of K1 with VIX, FFR, Oil, GBI_EM_Global_USD
+
+# simple correlation tests: 
+cor(QData_Final$K1, QData_Final$Oil, use ="pairwise.complete.obs")
+cor(QData_Final$K1, QData_Final$Commodity, use ="pairwise.complete.obs")
+cor(QData_Final$K1, QData_Final$VIX, use ="pairwise.complete.obs")
+cor(QData_Final$K1, QData_Final$FFR, use ="pairwise.complete.obs")
+cor(QData_Final$K1, QData_Final$GBI_EM_Global_USD, use ="pairwise.complete.obs")
+cor(QData_Final$K1, QData_Final$GFBONDRM, use ="pairwise.complete.obs")
+cor(QData_Final$K1, QData_Final$MSCI, use ="pairwise.complete.obs")
+
+cor(QData_Final$K2, QData_Final$Oil, use ="pairwise.complete.obs")
+cor(QData_Final$K2, QData_Final$Commodity, use ="pairwise.complete.obs")
+cor(QData_Final$K2, QData_Final$VIX, use ="pairwise.complete.obs")
+cor(QData_Final$K2, QData_Final$FFR, use ="pairwise.complete.obs")
+cor(QData_Final$K2, QData_Final$GBI_EM_Global_USD, use ="pairwise.complete.obs")
+cor(QData_Final$K2, QData_Final$GFBONDRM, use ="pairwise.complete.obs")
+cor(QData_Final$K2, QData_Final$MSCI, use ="pairwise.complete.obs")
+
+
+## Plot the visualisations
+# Standardize EACH variable separately BEFORE pivoting 
+macro_base <- QData_Final %>%
+  dplyr::select(YearQtr, K1, K2, VIX, FFR, Oil, GBI_EM_Global_USD, Commodity, MSCI) %>%
+  dplyr::distinct(YearQtr, .keep_all = TRUE) %>%
+  dplyr::filter(!is.na(K1))
+
+# Standardize each column separately (z-scores)
+standardize <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+
+# INVERT FACTOR SIGNS for display (so correlations are more intuitive)
+# PCA factors are identified up to sign rotation (Bai & Ng, 2008), so we flip
+# K1 and K2 to show positive correlation with bond prices (GBI-EM)
+macro_standardized <- macro_base %>%
+  dplyr::mutate(
+    # Invert factor signs for display purposes only
+    K1_inverted = -K1,  K2_inverted = -K2,
+    # Standardize all variables
+    dplyr::across(c(K1_inverted, K2_inverted, VIX, FFR, Oil, GBI_EM_Global_USD, Commodity, MSCI), standardize, .names = "{.col}_std"))
+
+# Create nice labels for variables
+var_labels <- c(
+  "VIX" = "VIX (Volatility Index)", 
+  "FFR" = "Federal Funds Rate", 
+  "Oil" = "Oil Price (Brent)", 
+  "GBI_EM_Global_USD" = "GBI-EM Global (USD)",
+  "Commodity" = "Commodity Price Index",
+  "MSCI" = "MSCI World Index")
+
+# Function to aggregate plots of factor vis-a-vis macro trends
+create_factor_plot <- function(data, factor_name, inverted = TRUE) {
+  # Use inverted factors for display
+  factor_std_col <- if(inverted) paste0(factor_name, "_inverted_std") else paste0(factor_name, "_std")
+  factor_orig_col <- if(inverted) paste0(factor_name, "_inverted") else factor_name
+  # Pivot the macro variables (standardized)
+  macro_long <- data %>%
+    dplyr::select(YearQtr, all_of(factor_std_col), 
+                  VIX_std, FFR_std, Oil_std, GBI_EM_Global_USD_std, Commodity_std, MSCI_std) %>%
+    tidyr::pivot_longer(
+      cols = c(VIX_std, FFR_std, Oil_std, GBI_EM_Global_USD_std, Commodity_std, MSCI_std),
+      names_to = "Macro_Variable",
+      values_to = "Macro_Value_std"
+    ) %>%
+    dplyr::mutate(
+      Macro_Variable_Clean = gsub("_std$", "", Macro_Variable),
+      Macro_Label = factor(Macro_Variable_Clean, levels = names(var_labels), labels = var_labels),
+      Factor_std = .data[[factor_std_col]]
+    )
+  # Calculate correlations using inverted (non-standardized) values
+  correlations <- data %>%
+    dplyr::summarize(
+      VIX = cor(.data[[factor_orig_col]], VIX, use = "pairwise.complete.obs"),
+      FFR = cor(.data[[factor_orig_col]], FFR, use = "pairwise.complete.obs"),
+      Oil = cor(.data[[factor_orig_col]], Oil, use = "pairwise.complete.obs"),
+      GBI_EM_Global_USD = cor(.data[[factor_orig_col]], GBI_EM_Global_USD, use = "pairwise.complete.obs"),
+      Commodity = cor(.data[[factor_orig_col]], Commodity, use = "pairwise.complete.obs"),
+      MSCI = cor(.data[[factor_orig_col]], MSCI, use = "pairwise.complete.obs")
+    ) %>%
+    tidyr::pivot_longer(everything(), names_to = "Macro_Variable_Clean", values_to = "cor") %>%
+    dplyr::mutate(
+      Macro_Label = factor(Macro_Variable_Clean, levels = names(var_labels), labels = var_labels),
+      cor_label = paste0("ρ = ", sprintf("%.2f", cor))
+    )
+  # Create the plot with proper YearQtr formatting
+  p <- ggplot(macro_long, aes(x = YearQtr)) +
+    geom_line(aes(y = Macro_Value_std, color = "Macro Variable"), linewidth = 0.8) +
+    geom_line(aes(y = Factor_std, color = paste("PCA Factor", factor_name)), linewidth = 0.8, linetype = "dashed") +
+    geom_label(data = correlations, 
+               aes(x = as.yearqtr("2001 Q1"), y = Inf, label = cor_label),
+               hjust = 0, vjust = 1.2, size = 3, fill = "white", alpha = 0.8,
+               label.size = 0, fontface = "bold") +
+    facet_wrap(~ Macro_Label, ncol = 3, scales = "fixed") +
+    scale_x_yearqtr(format = "%Y Q%q") +  # Format x-axis as "2000 Q1"
+    scale_color_manual(values = setNames(c("steelblue", "red"), 
+                                         c("Macro Variable", paste("PCA Factor", factor_name)))) +
+    coord_cartesian(ylim = c(-3.5, 3.5)) +
+    labs(
+      title = paste("PCA Factor", factor_name, "vs. Global Macro Dynamics"),
+      subtitle = "Validating that the factor captures common shocks (both series standardized to z-scores)",
+      x = "Quarter",
+      y = "Standardized Value",
+      color = "",
+      caption = "ρ = Pearson correlation."
+    ) +
+    theme_minimal() +
+    theme(
+      strip.text = element_text(face = "bold", size = 9),
+      strip.background = element_rect(fill = "lightgray", color = NA),
+      legend.position = "bottom",
+      plot.title = element_text(size = 12, face = "bold"),
+      plot.subtitle = element_text(size = 9),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      panel.grid.minor = element_blank()
+    )
+  
+  return(list(plot = p, correlations = correlations))
+}
+
+# Create and display plots for both factors
+k1_results <- create_factor_plot(macro_standardized, "K1", inverted = TRUE)
+print(k1_results$correlations %>% dplyr::select(Macro_Label, cor))
+print(k1_results$plot)
+
+k2_results <- create_factor_plot(macro_standardized, "K2", inverted = TRUE)
+print(k2_results$correlations %>% dplyr::select(Macro_Label, cor))
+print(k2_results$plot)
+
+```
+
+
+```{r Linear Quantile Mixture Model}
+# Add PCA Factors to QData_QIFE
+# Now join to QData_QIFE (both have standard YearQtr string)
+QData_QIFE <- QData_Final # Ensure QData_Final contains the factors from PCA_factor_df, if not, join again: 
+# E,g. QData_QIFE <- QData_QIFE %>%   left_join(PCA_factor_df, by = "YearQtr") # And ensure YearQtr is not numeric
+
+
+# This section has 3 subsections; 1) A manual test of lqmix for one specification and quantile, 
+# 2) A loop across all specifications, quantiles, factors, and groups, stored separately (requires manual update of qife_results_df)
+# 3) Ggplot of the results using qife_results_df, remember to set it to the corresponding group number of interest
+
+# 1) Manual test
+# Explanation of the main arguments in the linear quantile mixture model, i.e. QIFE:
+# randomTC = ~ 1 + K1 (+ K2)
+#   ~ 1      : Random Intercept (alpha_i) -> Country (or group)-specific constant
+#   + K1/K2  : Random Slopes on PCA factors (lambda_i * K_t) -> Country (or group)-specific sensitivity to global cycle
+# Note: lqmix estimates one quantile at a time; loop runs 5 quantiles x 2 factor specs x 3 DVs x 4 IVs ≈ 120 models, with R = 500 takes around 10 hours to run.
+
+QIFE_Test <- lqmix(
+  formula = TwoYrSpread ~ BII_Weighted_L1 + Inflation + PB + CA + GDP + DebtGDP + FM_Depth + WGI_RL + CPI_Food,      
+  randomTC = ~ 1 + K1 + K2,          # Time-Constant Random Coefficients (group-specific loadings)
+  group = "ISO3",                                 # Grouping variable (Country) - must be string
+  time = "YearQtr",                               # Time variable - must be string
+  G = 4,                                          # Number of mixture components for TC random coefficients
+  data = QData_QIFE,
+  qtl = 0.25,                                      # Quantile to estimate (10th percentile)
+  se = TRUE,                                      # Compute standard errors
+  R = 500,                                        # Number of bootstrap samples for SE
+  verbose = TRUE)
+summary(QIFE_Test)
+
+# 2) Loop through all quantile IFE specifications
+# Define specifications
+dependent_vars <- c("TwoYrSpread", "FiveYrSpread", "TenYrSpread")
+independent_vars <- c("BII_Weighted_L1", "BHI_Weighted_L1", "EPI_L1", "NDGAIN_L1")
+controls <- c("Inflation", "PB", "CA", "GDP", "DebtGDP", "FM_Depth", "WGI_RL", "CPI_Food")
+quantiles <- c(0.1, 0.25, 0.5, 0.75, 0.9)
+num_factors <- c(1, 2)  # k = 1 and k = 2
+R_boot <- 500
+
+# Function runs QIFE for all specifications and stores results in a nested list: qife_results[[dv]][[iv]][[k]][[quantile]]
+run_qife_grid <- function(n_groups) {
+  results <- list()
+  for (dv in dependent_vars) {
+    results[[dv]] <- list()
+    dv_abbrev <- gsub("YrSpread", "", dv)
+
+    for (iv in independent_vars) {
+      results[[dv]][[iv]] <- list()
+
+      for (k in num_factors) {
+        results[[dv]][[iv]][[paste0("k", k)]] <- list()
+        randomTC_formula <- if (k == 1) ~ 1 + K1 else ~ 1 + K1 + K2
+
+        for (qtl in quantiles) {
+          iv_abbrev <- gsub("_Weighted_L1|_L1", "", iv)
+          model_name <- paste0(dv_abbrev, "_", iv_abbrev, "_K", k, "_G", n_groups,
+                               "_q", gsub("\\.", "", as.character(qtl)))
+          message(paste("Running:", model_name))
+
+          formula_obj <- as.formula(paste(dv, "~", iv, "+",
+                                          paste(controls, collapse = " + ")))
+
+          fit <- tryCatch({
+            lqmix(
+              formula = formula_obj,
+              randomTC = randomTC_formula,
+              group = "ISO3",
+              time = "YearQtr",
+              G = n_groups,
+              data = QData_QIFE,
+              qtl = qtl,
+              se = TRUE,
+              R = R_boot,
+              verbose = TRUE
+            )
+          }, error = function(e) {
+            message(paste("Error in", model_name, ":", e$message))
+            return(NULL)
+          })
+
+          if (!is.null(fit)) {
+            results[[dv]][[iv]][[paste0("k", k)]][[as.character(qtl)]] <- fit
+            message(paste("Completed:", model_name))
+          } else {
+            message(paste("Failed:", model_name))
+          }
+        }
+      }
+    }
+  }
+  results
+}
+# Run QIFE for factors 1, 2, all quantiles, EVs and DVs, but separately for each number of groups (G=3, 4, or 5)
+qife_results_G3 <- run_qife_grid(3)
+qife_results_G4 <- run_qife_grid(4)
+qife_results_G5 <- run_qife_grid(5)
+# Save results accordingly to disk. 
+#saveRDS(qife_results_G3, file = "qife_results_G3.rds")
+#saveRDS(qife_results_G4, file = "qife_results_G4.rds")
+#saveRDS(qife_results_G5, file = "qife_results_G5.rds")
+
+# Reload stored results (use after a full run, or skip the loops above). On a MBP 2023 M3 Pro, it takes > 10 hours to run the full loops, use a HPC if available. 
+qife_results_G3 <- readRDS("qife_results_G3.rds")
+qife_results_G4 <- readRDS("qife_results_G4.rds")
+# qife_results_G5 <- readRDS("qife_results_G5.rds")
+
+# Display summaries for key models (quantile, factor e.g. k=2, key DV e.g. TwoYrSpread)
+qife_results <- qife_results_G4
+for (iv in independent_vars) {
+  iv_abbrev <- gsub("_Weighted_L1|_L1", "", iv)
+  model_key <- qife_results[["TwoYrSpread"]][[iv]][["k2"]][["0.9"]]
+  if (!is.null(model_key)) {
+    # print(summary(model_key))
+  }
+}
+
+## Extract Coefficients from Quantile IFE Results for Visualization
+extract_qife_coefficients <- function(qife_results_list, g = NA) {
+  all_coefs <- list()
+  for (dv in names(qife_results_list)) {
+    for (iv in names(qife_results_list[[dv]])) {
+      for (k_nm in names(qife_results_list[[dv]][[iv]])) {
+        for (qtl_str in names(qife_results_list[[dv]][[iv]][[k_nm]])) {
+          model <- qife_results_list[[dv]][[iv]][[k_nm]][[qtl_str]]
+          if (is.null(model)) next
+
+          model_summary <- tryCatch(summary(model), error = function(e) {
+            message(paste("Error calling summary for", dv, iv, k_nm, qtl_str, ":", e$message))
+            return(NULL)
+          })
+
+          coef_table <- NULL
+          if (!is.null(model_summary) && !is.null(model_summary$fix)) {
+            coef_table <- model_summary$fix
+          }
+          if (is.null(coef_table) && !is.null(model$betaf) && !is.null(model$se.betaf)) {
+            coef_table <- cbind(Estimate = model$betaf, `St.Error` = model$se.betaf)
+          }
+          if (is.null(coef_table)) {
+            message(paste("Could not find coefficients for", dv, iv, k_nm, qtl_str))
+            next
+          }
+
+          if (is.vector(coef_table)) {
+            coef_table <- matrix(coef_table, ncol = 1,
+                                 dimnames = list(names(coef_table), "Estimate"))
+          }
+
+          sigma_e <- NA
+          if (!is.null(model_summary) && !is.null(model_summary$sigma.e)) {
+            sigma_e <- model_summary$sigma.e
+          } else if (!is.null(model$sigma.e)) {
+            sigma_e <- model$sigma.e
+          }
+
+          if (iv %in% rownames(coef_table)) {
+            all_coefs[[length(all_coefs) + 1]] <- data.frame(
+              dependent = dv,
+              independent = iv,
+              quantile = as.numeric(qtl_str),
+              k = as.numeric(gsub("^k|^r", "", k_nm)),
+              G = g,
+              estimate = coef_table[iv, 1],
+              std.error = if (ncol(coef_table) >= 2) coef_table[iv, 2] else NA,
+              p.value = if (ncol(coef_table) >= 4) coef_table[iv, 4] else NA,
+              sigma.e = sigma_e,
+              stringsAsFactors = FALSE
+            )
+          } else {
+            message(paste("IV", iv, "not found in coefficient table for", dv, k_nm, qtl_str,
+                          "- Available:", paste(rownames(coef_table), collapse = ", ")))
+          }
+        }
+      }
+    }
+  }
+
+  if (length(all_coefs) == 0) {
+    warning("No coefficients extracted from qife_results")
+    return(data.frame())
+  }
+
+  do.call(rbind, all_coefs)
+}
+
+qife_3group_coefs_df <- extract_qife_coefficients(qife_results_G3, g = 3)
+qife_4group_coefs_df <- extract_qife_coefficients(qife_results_G4, g = 4)
+qife_5group_coefs_df <- extract_qife_coefficients(qife_results_G5, g = 5)
+
+saveRDS(qife_3group_coefs_df, file = "qife_3group_coefs_df.rds")
+saveRDS(qife_4group_coefs_df, file = "qife_4group_coefs_df.rds")
+saveRDS(qife_5group_coefs_df, file = "qife_5group_coefs_df.rds")
+
+# Reload coef tables without re-estimating
+qife_3group_coefs_df <- readRDS("qife_3group_coefs_df.rds")
+qife_4group_coefs_df <- readRDS("qife_4group_coefs_df.rds")
+qife_5group_coefs_df <- readRDS("qife_5group_coefs_df.rds")
+
+# Set G of interest for tables/plots (headline spec: G = 4)
+# qife_coefs_df <- qife_3group_coefs_df
+qife_coefs_df <- qife_4group_coefs_df
+# qife_coefs_df <- qife_5group_coefs_df
+
+# 3) Plot QIFE results: 
+if (nrow(qife_coefs_df) == 0) {
+  warning("Could not extract coefficients from qife_results. Check model structure.")
+} else {
+  qife_coefs_df <- qife_coefs_df %>%
+    dplyr::mutate(
+      p.value = ifelse(is.na(p.value) & !is.na(std.error) & std.error > 0,
+                       2 * (1 - pnorm(abs(estimate / std.error))), p.value),
+      significance = case_when(
+        !is.na(p.value) & p.value < 0.01 ~ "***",
+        !is.na(p.value) & p.value < 0.05 ~ "**",
+        !is.na(p.value) & p.value < 0.1  ~ "*",
+        TRUE ~ ""
+      ),
+      dependent_label = factor(dependent,
+        levels = c("TwoYrSpread", "FiveYrSpread", "TenYrSpread"),
+        labels = c("2-Year Spread", "5-Year Spread", "10-Year Spread")),
+      independent_label = factor(independent,
+        levels = c("BII_Weighted_L1", "BHI_Weighted_L1", "EPI_L1", "NDGAIN_L1"),
+        labels = c("Biodiversity Degradation (BII)", "Biodiversity Degradation (BHI)",
+                   "Environmental Performance Index", "Climate Vulnerability (ND-GAIN)"))
+    )
+
+  # Single plotting function for both k=1 and k=2
+  y_limits <- c(-0.3, 1.2)
+
+  plot_qife <- function(data, k) {
+    if (nrow(data) == 0) { warning(paste("No data for k=", k)); return(invisible(NULL)) }
+
+    sigma_labels <- data %>%
+      dplyr::group_by(dependent_label, independent_label) %>%
+      dplyr::summarise(
+        label = paste0("\u03c3 = ", sprintf("%.3f", mean(sigma.e, na.rm = TRUE))),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(x = 0.9, y = -Inf)
+
+    ggplot(data, aes(x = quantile, y = estimate)) +
+      geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+      geom_ribbon(aes(ymin = estimate - 1.96 * std.error,
+                      ymax = estimate + 1.96 * std.error), fill = "grey", alpha = 0.3) +
+      geom_line(color = "blue", linewidth = 0.8) +
+      geom_point(color = "red", size = 2) +
+      geom_text(aes(label = significance), vjust = -0.5, size = 3) +
+      geom_text(data = sigma_labels, aes(x = x, y = y, label = label),
+                hjust = 1, vjust = -0.5, size = 2.5, color = "darkgray", fontface = "italic") +
+      facet_grid(dependent_label ~ independent_label) +
+      scale_y_continuous(limits = y_limits) +
+      labs(
+        title    = paste0("Asymmetric Impact of Nature-Related Financial Vulnerability"),
+        subtitle = paste0("Quantile IFE with ", k, " factor", if (k > 1) "s" else "",
+                          ". Rightmost points represent high borrowing cost countries."),
+        x = "Quantile", y = "Marginal Effect on Sovereign Bond Yield Spread (pp)",
+        caption  = "Significance: *** p<0.01, ** p<0.05, * p<0.1. 95% confidence intervals from block-bootstrapped standard errors with 500 replications per quantile. \u03c3 = mean standard deviation of error terms. 57 countries, quarterly, 2000-2020."
+      ) +
+      theme_minimal() +
+      theme(
+        strip.text       = element_text(face = "bold"),
+        strip.background = element_rect(fill = "lightgray", color = NA),
+        panel.spacing    = unit(1, "lines"),
+        plot.title       = element_text(size = 12, face = "bold"),
+        plot.subtitle    = element_text(size = 10),
+        plot.caption     = element_text(size = 8, color = "grey50"),
+        axis.title       = element_text(size = 10),
+        axis.text        = element_text(size = 9)
+      )
+  }
+
+  # Support legacy coef tables that used column `r` instead of `k`
+  if (!"k" %in% names(qife_coefs_df) && "r" %in% names(qife_coefs_df)) {
+    qife_coefs_df$k <- qife_coefs_df$r
+  }
+  print(plot_qife(dplyr::filter(qife_coefs_df, k == 2), k = 2))
+  print(plot_qife(dplyr::filter(qife_coefs_df, k == 1), k = 1))
+}
+
+
+# Robustness Check: Test for number of groups
+# Search for optimal G (e.g., test G = 1 to 4)
+search_res <- search_lqmix(
+  formula = TwoYrSpread ~ NDGAIN_L1 + Inflation + PB + CA + GDP + DebtGDP + FM_Depth + WGI_RL + CPI_Food,
+  randomTC = ~ 1 + K1 + K2,
+  group = "ISO3",
+  time = "YearQtr",
+  Gv = 1:10,          # Test G from 1 to 4
+  data = QData_QIFE,
+  qtl = 0.5,         # Usually sufficient to test on median
+  method = "aic",    # Information Criterion 
+  se = FALSE         # Faster without SEs
+)
+plot(search_res)     # Look for the "elbow" or minimum BIC
+# It seems that G≈4 is optimal, 5 sometimes yields somewhat important improvements yet often marginal. 5 and 3 Gv thus serve as robustness tests
+```
